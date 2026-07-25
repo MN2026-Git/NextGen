@@ -590,8 +590,8 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      # === EDIT 2: launcher - hardened Funnel + Funnel URL is PRIMARY ===
-      - name: Write Mission Control launcher (starts server + hardened FUNNEL)
+      # === EDIT 1: launcher - robust Funnel (works when ACL done) + passes funnel status to Summary ===
+      - name: Write Mission Control launcher (starts server + robust FUNNEL)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
@@ -639,23 +639,26 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if(-not $up){ Line Red "[server] did NOT start." }
-          # === EDIT 2 core: hardened Funnel enable (3 attempts, --yes, verify DNS) ===
-          $funnelUrl=''
+          # === robust Funnel enable (ACL must be ON - see ACTION 1) ===
+          $funnelUrl=''; $funnelErr=''
           if($up){
-            # make sure serve/funnel features are on for this node
-            & $ts set --advertise-exit-node=false 2>$null | Out-Null; $LASTEXITCODE=0
-            for($fa=1;$fa -le 3;$fa++){
+            for($fa=1;$fa -le 4;$fa++){
               $ferr = & $ts funnel --yes $Port on 2>&1
               $ferr | ForEach-Object { Line DarkGray ("[funnel] {0}" -f $_) }
               $LASTEXITCODE=0; Start-Sleep -Seconds 4
               $stj = $null; try { $stj = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop } catch {}
               $dns = if($stj){ $stj.Self.DNSName } else { $null }
               if($dns){ $dns=$dns.TrimEnd('.'); $funnelUrl = ("https://{0}/?key={1}" -f $dns,$cfg.dashToken); Line Green ("[funnel] ENABLED -> {0}" -f $funnelUrl); break }
-              Line Yellow ("[funnel] attempt {0}: no DNS yet (ACL 'funnel' attr may be missing - see EDIT 1)" -f $fa)
+              $funnelErr = ("attempt {0}: {1}" -f $fa, ($ferr -join ' '))
+              Line Yellow ("[funnel] {0}" -f $funnelErr)
               Start-Sleep -Seconds 3
             }
-            if(-not $funnelUrl){ Line Red "[funnel] NOT enabled. FIX: Tailscale admin -> ACLs -> add nodeAttrs target * attr funnel (EDIT 1), then re-run. Until then use the ghrdp:// link in Summary (zero typing, no dashboard needed)." }
-            $cfg.funnelUrl = $funnelUrl; SaveCfg $cfg
+            if(-not $funnelUrl){
+              Line Red "[funnel] NOT enabled."
+              Line Red "  -> If you have NOT done ACTION 1 yet: Tailscale admin -> ACLs -> add nodeAttrs target * attr funnel -> Save -> re-run."
+              Line Red "  -> If you ALREADY did ACTION 1: the tailnet may need 'funnel' in autoApprovers, or wait 1 min and re-run."
+            }
+            $cfg.funnelUrl = $funnelUrl; $cfg.funnelErr = $funnelErr; SaveCfg $cfg
           }
           $loopOk=$false; try { Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/" -f $Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $loopOk=$true } catch {}
           Line $(if($loopOk){'Green'}else{'Red'}) ("[selftest] loopback 127.0.0.1:{0} = {1}" -f $Port,$loopOk)
@@ -675,7 +678,7 @@ jobs:
           }
           EOF
 
-      # === EDIT 3: summary - Funnel link PRIMARY (works from local pc), ghrdp:// SECONDARY ===
+      # === EDIT 2: summary - clickable Funnel hyperlink when ACL done; exact ACL box + ghrdp fallback when not ===
       - name: Write summary helper (highlighted ONE-CLICK link in Summary)
         shell: bash
         run: |
@@ -684,33 +687,49 @@ jobs:
           $ErrorActionPreference='SilentlyContinue'
           if(-not (Test-Path $CfgPath)){ return }
           $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
-          $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp; $funnel=$cfg.funnelUrl
+          $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp; $funnel=$cfg.funnelUrl; $ferr=$cfg.funnelErr
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host '============================================================'
           Write-Host ('  RDP READY  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
-          if($funnel){ Write-Host ('  PRIMARY (local pc, click): ' + $funnel) }
-          Write-Host ('  SECONDARY (zero-typing, paste in browser bar): ' + $ghrdp)
+          if($funnel){ Write-Host ('  PRIMARY clickable (local pc): ' + $funnel) }
+          else       { Write-Host '  PRIMARY clickable: MISSING -> do ACTION 1 (Tailscale ACL) then re-run.' }
+          Write-Host ('  ZERO-TYPING (paste in browser bar, no hyperlink possible): ' + $ghrdp)
           Write-Host '============================================================'
           '### RDP is ready' >> $S
           '' >> $S
           if($funnel){
-            '#### 1) BEST - click on your local pc (loads dashboard, auto-connects RDP, zero typing):' >> $S
+            '#### 1) CLICK on your local pc (hyperlink - loads the web dashboard, auto-connects RDP, zero typing):' >> $S
             '' >> $S
-            ('**[>>> OPEN RDP FROM YOUR PC <<<](' + $funnel + ')**') >> $S
+            ('**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](' + $funnel + ')**') >> $S
             '' >> $S
             ('Copyable: `' + $funnel + '`') >> $S
             '' >> $S
+            'First time on a new PC the page auto-shows the connector installer (Download + Run with PowerShell once); tick Always-allow on the browser prompt once. After that every click auto-connects with no typing.' >> $S
+            '' >> $S
           } else {
-            '#### 1) Funnel not enabled yet - do EDIT 1 (Tailscale ACL) then re-run to get the local-pc dashboard link.' >> $S
+            '#### ⚠️ ONE-TIME SETUP NEEDED for the clickable local-pc web-app link' >> $S
+            '' >> $S
+            'The clickable hyperlink needs **Tailscale Funnel**, which is OFF on your tailnet right now (that is why no https link appears). Turn it ON **once** at **https://login.tailscale.com/admin/acls** by merging this into the ACL JSON (keep your existing `acls`/`ssh` blocks, just add `nodeAttrs`), then **re-run** this workflow:' >> $S
+            '' >> $S
+            '```json' >> $S
+            '{' >> $S
+            '  "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ],' >> $S
+            '  "nodeAttrs": [ { "target": ["*"], "attr": ["funnel"] } ],' >> $S
+            '  "ssh": [ { "action": "check", "src": ["autogroup:members"], "dst": ["autogroup:self"], "users": ["autogroup:nonroot", "root"] } ]' >> $S
+            '}' >> $S
+            '```' >> $S
+            '' >> $S
+            if($ferr){ ('Last Funnel error from the runner: `' + $ferr + '`') >> $S; '' >> $S }
+            'After re-run, a **clickable** `https://....ts.net/?key=...` link appears above and opens the dashboard on your pc.' >> $S
             '' >> $S
           }
-          '#### 2) ZERO-TYPING RDP without dashboard (works always) - paste this in your LOCAL browser address bar + Enter, click Open once:' >> $S
+          '#### 2) ZERO-TYPING RDP right now (no hyperlink - GitHub blocks custom-scheme links, so PASTE this in your LOCAL browser address bar + Enter, then click Open once):' >> $S
           '' >> $S
           '```' >> $S
           $ghrdp >> $S
           '```' >> $S
           '' >> $S
-          'First time on a new PC: the page (or the address bar) needs the connector once - if RDP does not auto-open, on the dashboard click Download connector and Run with PowerShell one time; after that every click auto-connects with no typing.' >> $S
+          'This opens RDP with the password auto-filled (no IP/user/password typing). On a brand-new PC the first paste may show nothing until the connector is installed once - in that case open the dashboard from inside RDP and use its Download-connector button, or use method 1 after ACTION 1.' >> $S
           '' >> $S
           '#### 3) Manual mstsc (reference only)' >> $S
           '' >> $S
@@ -718,6 +737,59 @@ jobs:
           '' >> $S
           if($cfg.mirror){ ('Mirror ON: inside RDP open the dashboard and click UPLOAD-EVERYTHING-NOW, wait for the green banner, then Cancel. Index: ' + $cfg.rentryUrl) >> $S }
           EOF
+
+      # === EDIT 3: installer part - robust, self-verifying, friendly (no admin, first-time safe) ===
+      - name: Write ghrdp installer part (registry; helper embedded as base64 marker)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/ghrdp-install.part.ps1" <<'PARTEOF'
+          param()
+          # friendly top-level guard: never crash with a raw red error for a first-time user
+          try {
+            $hb64 = 'REPLACE_ME_B64'
+            $dir = Join-Path $env:LOCALAPPDATA 'ghrdp'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $helperPath = Join-Path $dir 'ghrdp.ps1'
+            $helperText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($hb64))
+            Set-Content -Path $helperPath -Value $helperText -Encoding ASCII
+            $root='HKCU:\Software\Classes\ghrdp'
+            New-Item -Path $root -Force | Out-Null
+            Set-Item -Path $root -Value 'URL:GitHub RDP Connect'
+            New-ItemProperty -Path $root -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
+            New-Item -Path "$root\shell\open\command" -Force | Out-Null
+            $pwsh=(Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
+            if(-not $pwsh){ $pwsh='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
+            Set-Item -Path "$root\shell\open\command" -Value "`"$pwsh`" -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$helperPath`" `"%1`""
+            # ---- self verify (so a first-time user never wonders if it worked) ----
+            $ok = [bool](Get-ItemProperty -Path "$root\shell\open\command" -ErrorAction SilentlyContinue)
+            $ok = $ok -and (Test-Path $helperPath)
+            Write-Host ''
+            if($ok){
+              Write-Host '====================================================' -ForegroundColor Green
+              Write-Host '  SUCCESS - RDP connector installed.' -ForegroundColor Green
+              Write-Host '  Now go back and CLICK the RDP link again.' -ForegroundColor Green
+              Write-Host '  RDP will open with NO typing.' -ForegroundColor Green
+              Write-Host '  (If the browser asks "Open app?" tick Always-allow + Open once.)' -ForegroundColor Yellow
+              Write-Host '====================================================' -ForegroundColor Green
+            } else {
+              Write-Host '====================================================' -ForegroundColor Red
+              Write-Host '  INSTALL LOOKS INCOMPLETE - registry key missing.' -ForegroundColor Red
+              Write-Host '  Re-run this script by RIGHT-CLICK -> Run with PowerShell.' -ForegroundColor Yellow
+              Write-Host '  If blocked: file Properties -> Unblock, or run in PowerShell:' -ForegroundColor Yellow
+              Write-Host '    Set-ExecutionPolicy -Scope CurrentUser Bypass -Force' -ForegroundColor Cyan
+              Write-Host '====================================================' -ForegroundColor Red
+            }
+          } catch {
+            Write-Host ''
+            Write-Host '====================================================' -ForegroundColor Red
+            Write-Host '  INSTALL ERROR (copy this line if you need help):' -ForegroundColor Red
+            Write-Host ("  " + $_.Exception.Message) -ForegroundColor Red
+            Write-Host '  Most common fix - run this once in PowerShell then retry:' -ForegroundColor Yellow
+            Write-Host '    Set-ExecutionPolicy -Scope CurrentUser Bypass -Force' -ForegroundColor Cyan
+            Write-Host '====================================================' -ForegroundColor Red
+          }
+          try { Write-Host ''; Read-Host 'Press Enter to close this window' } catch {}
+          PARTEOF
 
       - name: Configure theme + bookmarks + apps + Mission Control shortcut
         run: |
