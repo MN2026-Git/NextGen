@@ -20,7 +20,6 @@ jobs:
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $out = "tailscale-setup.msi"
           $ok = $false
-          # primary: curl.exe with built-in retries (resilient to "connection forcibly closed")
           for ($a=1; $a -le 4; $a++) {
             Remove-Item $out -Force -ErrorAction SilentlyContinue
             & curl.exe -fL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 30 --max-time 300 -o $out $url 2>$null
@@ -28,7 +27,6 @@ jobs:
             if ((Test-Path $out) -and (Get-Item $out).Length -gt 1000000) { $ok = $true; Write-Host "Downloaded via curl (attempt $a), size=$((Get-Item $out).Length)"; break }
             Write-Host "curl attempt $a failed, retrying in $((3*$a))s..."; Start-Sleep -Seconds (3 * $a)
           }
-          # fallback: Invoke-WebRequest with TLS12
           if (-not $ok) {
             for ($a=1; $a -le 3; $a++) {
               try { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing; if ((Test-Path $out) -and (Get-Item $out).Length -gt 1000000) { $ok = $true; Write-Host "Downloaded via IWR (attempt $a)"; break } } catch { Write-Host "IWR attempt $a failed: $_" }
@@ -96,15 +94,14 @@ jobs:
           New-LocalUser -Name $user -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -FullName "RDP Session" -PasswordNeverExpires -ErrorAction Stop | Out-Null
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
-          # NOTE: do NOT pre-create anything inside C:\Users\<user> here - it corrupts first-logon profile creation (causes stuck "User Profile Service").
           if (Test-Path 'D:\') {
             $big = 'D:\RDP-Storage'; New-Item -ItemType Directory -Path $big -Force | Out-Null
             & icacls.exe $big /grant "${user}:(OI)(CI)F" 2>$null | Out-Null; $LASTEXITCODE = 0
             $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut("C:\Users\Public\Desktop\RDP-Storage (D).lnk"); $sc.TargetPath = $big; $sc.Save()
-            Write-Host "D:\RDP-Storage ready (146GB-backed, mirrored, use as qBittorrent save path)."
+            Write-Host "D:\RDP-Storage ready (146GB-backed, mirrored)."
           } else { Write-Host "No D: drive detected." }
           Add-Content $env:GITHUB_ENV "RDP_USER=$user"; Add-Content $env:GITHUB_ENV "RDP_PASS=$pass"
-          Write-Host "Created account: $user (profile will build cleanly at first login)"
+          Write-Host "Created account: $user"
 
       - name: Write mirror lib (shared functions)
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
@@ -114,20 +111,23 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           function Read-Cfg { Get-Content $env:GHRDP_CFG -Raw | ConvertFrom-Json }
           function B64U($s){ $x=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($s)); return $x.Replace('+','-').Replace('/','_').TrimEnd('=') }
+          # STREAMING AES-256 (no full-file RAM load -> handles 5GB+). Opens input READ-ONLY SHARED so qBittorrent seeding locks are bypassed.
           function Encrypt-File($inPath,$outPath,$password){
           $aes=[System.Security.Cryptography.Aes]::Create(); $aes.KeySize=256; $aes.Mode='CBC'; $aes.Padding='PKCS7'
           $salt=[byte[]]::new(16); ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($salt)
           $aes.IV=[byte[]]::new(16); ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($aes.IV)
           $kdf=New-Object System.Security.Cryptography.Rfc2898DeriveBytes($password,$salt,100000,[System.Security.Cryptography.HashAlgorithmName]::SHA256); $aes.Key=$kdf.GetBytes(32)
-          $pt=[System.IO.File]::ReadAllBytes($inPath); $ct=$aes.CreateEncryptor().TransformFinalBlock($pt,0,$pt.Length)
-          $ms=New-Object System.IO.MemoryStream; $ms.Write($salt,0,16); $ms.Write($aes.IV,0,16); $ms.Write($ct,0,$ct.Length)
-          [System.IO.File]::WriteAllBytes($outPath,$ms.ToArray()); $ms.Close(); $aes.Clear() }
-          function Is-Locked($p){ try { $f=[System.IO.File]::Open($p,'Open','ReadWrite','None'); $f.Close(); return $false } catch { return $true } }
+          $outFs=[System.IO.File]::Create($outPath); $outFs.Write($salt,0,16); $outFs.Write($aes.IV,0,16)
+          $cs=New-Object System.Security.Cryptography.CryptoStream($outFs, $aes.CreateEncryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write)
+          $inFs=[System.IO.File]::Open($inPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+          $buf=[byte[]]::new(65536); $read=1
+          while($read -gt 0){ $read=$inFs.Read($buf,0,$buf.Length); if($read -gt 0){ $cs.Write($buf,0,$read) } }
+          $inFs.Close(); $cs.Close(); $outFs.Close(); $aes.Clear() }
           function Upload-Gofile($p){
           for ($a=1; $a -le 3; $a++){
           try {
-          $gs=(& curl.exe -s --max-time 20 "https://api.gofile.io/getServer") | ConvertFrom-Json -ErrorAction Stop; $srv=$gs.data.server
-          $raw=& curl.exe -s --max-time 600 -X POST "https://$srv.gofile.io/contents/uploadfile" -F "file=@$p"
+          $gs=(& curl.exe -s --max-time 30 "https://api.gofile.io/getServer") | ConvertFrom-Json -ErrorAction Stop; $srv=$gs.data.server
+          $raw=& curl.exe -s --max-time 1800 -X POST "https://$srv.gofile.io/contents/uploadfile" -F "file=@$p"
           $uj=$raw | ConvertFrom-Json -ErrorAction Stop
           if ($uj.status -eq 'ok') { if ($uj.data.downloadPage){return $uj.data.downloadPage}; if ($uj.data.code){return "https://gofile.io/d/$($uj.data.code)"}; if ($uj.data.id){return "https://gofile.io/d/$($uj.data.id)"} }
           "gofile try $a status=$($uj.status)" | Out-File $env:GHRDP_LOG -Append
@@ -148,7 +148,7 @@ jobs:
           [void]$sb.AppendLine("# GitHub RDP - mirrored files"); [void]$sb.AppendLine("")
           [void]$sb.AppendLine("Files are **AES-256 encrypted** on gofile. **Decrypt password:** ``$($cfg.decPw)``"); [void]$sb.AppendLine("")
           [void]$sb.AppendLine("| # | File | Status | One-click | gofile | Source | Time |"); [void]$sb.AppendLine("|---|---|---|---|---|---|---|")
-          if ($idx.Count -eq 0){ [void]$sb.AppendLine("| - | _(none)_ | - | - | - | - | - |") }
+          if ($idx.Count -eq 0){ [void]$sb.AppendLine("| - | _(none yet)_ | - | - | - | - | - |") }
           $n=1; foreach($it in $idx){ $oc=if($it.status -eq 'ok'){'[open](ghrdp://dl/'+$it.payload+')'}else{'-'}; $gf=if($it.gofile){'[gofile]('+$it.gofile+')'}else{'-'}; [void]$sb.AppendLine("| $n | "+$it.name+" | "+(Icon $it.status)+" | "+$oc+" | "+$gf+" | "+$it.src+" | "+$it.time+" |"); $n++ }
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
@@ -181,17 +181,25 @@ jobs:
           $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak')
           $done=@{}; if(Test-Path $cfg.doneFile){ Get-Content $cfg.doneFile | %{$done[$_]=$true} }
           $idx=Load-Index $cfg; $lastSize=@{}; $retryAfter=@{}
+          # initial push so the decrypt password + table appear on rentry immediately
+          Push-Rentry $cfg (Build-Rentry $cfg $idx) | Out-Null
           function Proc($fi,$tag){
-          if($done.ContainsKey($fi.FullName)){return}; if($retryAfter.ContainsKey($fi.FullName) -and (Get-Date) -lt $retryAfter[$fi.FullName]){return}
-          if(Is-Locked $fi.FullName){return}; if($lastSize.ContainsKey($fi.FullName) -and $lastSize[$fi.FullName] -ne $fi.Length){$lastSize[$fi.FullName]=$fi.Length;return}
-          $lastSize[$fi.FullName]=$fi.Length; $safe=$fi.Name -replace '\|','_'
+          if($done.ContainsKey($fi.FullName)){return}
+          if($retryAfter.ContainsKey($fi.FullName) -and (Get-Date) -lt $retryAfter[$fi.FullName]){return}
+          $cur=$fi.Length
+          # 2-cycle size-stable check: skip files still being written (partial). Seeding locks are NOT a problem (read-only shared open).
+          if(-not $lastSize.ContainsKey($fi.FullName)){ $lastSize[$fi.FullName]=$cur; return }
+          if($lastSize[$fi.FullName] -ne $cur){ $lastSize[$fi.FullName]=$cur; return }
+          $safe=$fi.Name -replace '\|','_'
           $ex=$idx | ?{$_.name -eq $safe -and $_.src -eq $tag} | select -First 1
           if(-not $ex){ $ex=@{name=$safe;src=$tag;status='uploading';payload='';gofile='';time=(Get-Date -f 'HH:mm:ss')}; [void]$idx.Add($ex); Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null }
-          $enc=Join-Path $env:TEMP ('ge_'+[guid]::NewGuid().ToString('N')+'.enc'); Encrypt-File $fi.FullName $enc $cfg.decPw
-          $gf=Upload-Gofile $enc; Remove-Item $enc -Force -ErrorAction SilentlyContinue
-          if($gf){ $ex.payload=B64U ($gf+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gf; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; if($retryAfter.ContainsKey($fi.FullName)){$retryAfter.Remove($fi.FullName)}; Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; "[$(Get-Date -f o)] OK $tag $($fi.Name)"|Out-File $cfg.logFile -Append }
+          $enc=Join-Path $env:TEMP ('ge_'+[guid]::NewGuid().ToString('N')+'.enc')
+          $gofile=$null
+          try { Encrypt-File $fi.FullName $enc $cfg.decPw; $gofile=Upload-Gofile $enc } catch { "encrypt/upload err $($fi.Name): $_" | Out-File $cfg.logFile -Append }
+          Remove-Item $enc -Force -ErrorAction SilentlyContinue
+          if($gofile){ $ex.payload=B64U ($gofile+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gofile; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; if($retryAfter.ContainsKey($fi.FullName)){$retryAfter.Remove($fi.FullName)}; Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; "[$(Get-Date -f o)] OK $tag $($fi.Name) ($cur bytes)"|Out-File $cfg.logFile -Append }
           else { $ex.status='limit'; $ex.time=(Get-Date -f 'HH:mm:ss'); $retryAfter[$fi.FullName]=(Get-Date).AddMinutes(5); Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; "[$(Get-Date -f o)] LIMIT $tag $($fi.Name)"|Out-File $cfg.logFile -Append } }
-          function Scan($r){ if(-not (Test-Path $r.path)){return}; $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue}; foreach($fi in $items){ if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}; if(((Get-Date)-$fi.LastWriteTime).TotalSeconds -lt 3){continue}; $p=$fi.FullName; if($p -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}; Proc $fi $r.tag } }
+          function Scan($r){ if(-not (Test-Path $r.path)){return}; $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue}; foreach($fi in $items){ if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}; $p=$fi.FullName; if($p -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}; Proc $fi $r.tag } }
           $fsw=$null
           try{ if(Test-Path $cfg.dlDir){ $fsw=New-Object System.IO.FileSystemWatcher; $fsw.Path=$cfg.dlDir; $fsw.IncludeSubdirectories=$false; $fsw.EnableRaisingEvents=$true; $fsw.NotifyFilter=[System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::LastWrite } }catch{}
           while($true){ foreach($r in $cfg.roots){ Scan $r }; if(Test-Path $cfg.flushFlag){ "[$(Get-Date -f o)] FLUSH seen"|Out-File $cfg.logFile -Append; for($p=0;$p -lt 8;$p++){ foreach($r in $cfg.roots){Scan $r}; if(-not ($idx | ?{$_.status -ne 'ok'})){break}; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 3 }
@@ -229,7 +237,6 @@ jobs:
           Write-Host "  RDP IS READY  (session alive 5h 30m)"
           Write-Host "  IP=$ip  USER=$user  PASS=$pass"
           Write-Host "  Dashboard=$redirectUrl (running=$serverOk)"
-          Write-Host "  ghrdp=$ghrdp"
           Write-Host "  >>> LOCAL PC must have Tailscale ON (same tailnet)."
           Write-Host "  >>> Clickable links + creds are in the SUMMARY tab."
           Write-Host "============================================================"
@@ -245,51 +252,42 @@ jobs:
           "**Method 2 - handler:** paste ``$ghrdp`` in browser address bar -> popup Open." >> $S
           "**Method 3 - manual (always works):** Win+R -> mstsc -> Computer ``$ip`` -> Connect -> user ``$user`` / pass ``$pass`` -> accept cert." >> $S
           "" >> $S
-          if($mirrorOn){ "### Mirror: ON (Downloads + Temp + D-RDP-Storage, AES-256). Index: https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe" >> $S }
+          if($mirrorOn){ "### Mirror: ON (Downloads + Temp + D-RDP-Storage, AES-256, streaming, seeding-lock-safe). Index: https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe" >> $S; "" >> $S; "### Cancel behaviour: 1st Cancel = graceful (qBittorrent stopped, ALL files uploaded before VM closes - RDP stays alive during the upload). 2nd Cancel = force-kill (closes immediately, then VM reclaimed)." >> $S }
           else { "### Mirror: OFF" >> $S }
 
       - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
         run: |
-          # ---- DEFENSIVE: never let a best-effort native exit code fail this step ----
           $ErrorActionPreference = 'Continue'
           function Reset-Exit { $script:LASTEXITCODE = 0 }
-          # ---- MACHINE-WIDE dark mode (HKLM -> applies to ALL users incl the RDP user, WITHOUT touching any profile) ----
           $mPers='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
           if(-not(Test-Path $mPers)){New-Item -Path $mPers -Force|Out-Null}
           New-ItemProperty -Path $mPers -Name 'AppsUseLightTheme'    -Value 0 -PropertyType DWord -Force|Out-Null
           New-ItemProperty -Path $mPers -Name 'SystemUsesLightTheme' -Value 0 -PropertyType DWord -Force|Out-Null
           New-ItemProperty -Path $mPers -Name 'ColorPrevalence'      -Value 0 -PropertyType DWord -Force|Out-Null
-          # ---- machine default accent (magenta) best-effort ----
           $mAcc='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent'
           if(-not(Test-Path $mAcc)){New-Item -Path $mAcc -Force|Out-Null}
           New-ItemProperty -Path $mAcc -Name 'AccentColorMenu' -Value 0x8c2bc4 -PropertyType DWord -Force|Out-Null
           New-ItemProperty -Path $mAcc -Name 'StartColor'      -Value 0x8c2bc4 -PropertyType DWord -Force|Out-Null
           New-ItemProperty -Path $mAcc -Name 'AccentColor'     -Value 0xffc42b8c -PropertyType DWord -Force|Out-Null
           try{ $mag=[byte[]](0x8C,0x2B,0xC4,0xFF,0x9E,0x33,0xD0,0xFF,0xB0,0x3B,0xDC,0xFF,0xC2,0x43,0xE8,0xFF,0x7A,0x22,0xB0,0xFF,0x66,0x1A,0x9C,0xFF,0x52,0x12,0x88,0xFF,0x3E,0x0A,0x74,0xFF); Set-ItemProperty -Path $mAcc -Name 'AccentPalette' -Value $mag -PropertyType Binary -Force|Out-Null }catch{}
-          Write-Host "Machine-wide dark mode + magenta accent set (RDP user gets it automatically, profile untouched)."
-          # ---- Edge extensions + managed favorites ----
+          Write-Host "Machine-wide dark mode + magenta accent set (profile untouched)."
           $edgePol='HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist'; if(-not(Test-Path $edgePol)){New-Item -Path $edgePol -Force|Out-Null}
           $crx='https://edge.microsoft.com/extensionwebstorebase/v1/crx'
           New-ItemProperty -Path $edgePol -Name '1' -Value "odfafepnkmbhccpbejgmiehpchacaeak;$crx" -PropertyType String -Force|Out-Null
           New-ItemProperty -Path $edgePol -Name '2' -Value "ifoakfbpdcdoeenechcleahebpibofpc;$crx" -PropertyType String -Force|Out-Null
           $fav='[{"name":"FMHY Torrenting","url":"https://fmhy.net/torrenting"},{"name":"GitHub RDP Mirror","url":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe"}]'
           New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'ManagedFavorites' -Value $fav -PropertyType String -Force|Out-Null
-          # ---- Firefox managed bookmarks ----
           $ffdist='C:\Program Files\Mozilla Firefox\distribution'; New-Item -ItemType Directory -Path $ffdist -Force|Out-Null
           $ffpol='{"policies":{"Bookmarks":[{"Title":"FMHY Torrenting","URL":"https://fmhy.net/torrenting","Placement":"toolbar"},{"Title":"GitHub RDP Mirror","URL":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe","Placement":"toolbar"}]}}'
           Set-Content -Path (Join-Path $ffdist 'policies.json') -Value $ffpol -Encoding UTF8
-          # ---- qBittorrent + Parsec (native exit codes reset so they can NEVER fail this step) ----
           try { winget install --id qBittorrent.qBittorrent -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "qBittorrent installed." } catch { Write-Host "qBittorrent winget failed (non-fatal)." }; Reset-Exit
           try { winget install --id Parsec.Parsec -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "Parsec installed." } catch { Write-Host "Parsec winget failed (non-fatal)." }; Reset-Exit
-          # NOTE: qBittorrent save path is NOT pre-set (that would touch the user profile and re-break login).
-          #       In qBittorrent set Options -> Downloads -> Default Save Path = D:\RDP-Storage (one time).
-          # ---- Parsec hosting config + autolaunch ONLY if installed ----
           $pcfg='C:\ProgramData\Parsec'; New-Item -ItemType Directory -Path $pcfg -Force|Out-Null
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
           if(Test-Path 'C:\Program Files\Parsec\parsecd.exe'){ New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Write-Host "Parsec autolaunch set." } else { Write-Host "Parsec exe not found - skipped autolaunch." }
           Reset-Exit
           "### Theme + Bookmarks + qBittorrent + Parsec Ready" >> $env:GITHUB_STEP_SUMMARY
-          "Machine-wide dark mode + magenta accent (auto for RDP user). Bookmarks set. qBittorrent + Parsec installed. For the exact purple-glow wallpaper: in RDP open Settings > Personalization and click the glow tile (1 click). Set qBittorrent save path to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
+          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. Exact purple-glow wallpaper: in RDP Settings > Personalization click the glow tile (1 click). qBittorrent save path -> set to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
           Write-Host "Configure step complete (no profile touched, exit forced 0)."
           exit 0
 
@@ -297,8 +295,10 @@ jobs:
         run: |
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $flushAt=New-TimeSpan -Hours 4 -Minutes 30
           $flushFlag=Join-Path $env:RUNNER_TEMP 'ghrdp_flush.flag'; $start=Get-Date; $flushed=$false
-          while(((Get-Date)-$start) -lt $limit){ if((-not $flushed) -and (((Get-Date)-$start) -ge $flushAt)){ "flush"|Out-File $flushFlag -Encoding ascii; $flushed=$true; Write-Host "4h30 -> flush flag." }; Start-Sleep -Seconds 60 }
-          Write-Host "5h30 done."
+          try {
+            while(((Get-Date)-$start) -lt $limit){ if((-not $flushed) -and (((Get-Date)-$start) -ge $flushAt)){ "flush"|Out-File $flushFlag -Encoding ascii; $flushed=$true; Write-Host "4h30 -> flush flag." }; Start-Sleep -Seconds 60 }
+          } catch { Write-Host "Keep Alive interrupted (cancel/timeout) - emergency upload step will run next." }
+          Write-Host "5h30 done or cancelled."
 
       - name: Emergency upload on cancel (always)
         if: ${{ always() && github.event.inputs.mirror_downloads_public == 'true' }}
@@ -308,38 +308,42 @@ jobs:
           $cfgPath=Join-Path $env:RUNNER_TEMP 'ghrdp_cfg.json'; $lib=Join-Path $env:RUNNER_TEMP 'ghrdp-lib.ps1'
           if(-not ((Test-Path $cfgPath) -and (Test-Path $lib))){ Write-Host "no mirror cfg/lib - skip"; exit 0 }
           $env:GHRDP_CFG=$cfgPath; $env:GHRDP_LIB=$lib; . $lib; $cfg=Read-Cfg; $env:GHRDP_LOG=$cfg.logFile
-          Write-Host "EMERGENCY pass (status=$env:STATUS)"
+          Write-Host "EMERGENCY pass (status=$env:STATUS) - stop writers, then upload EVERYTHING (streaming, lock-safe)."
+          # 1) STOP writers so seeding/partial locks release and files flush to disk (RDP VM stays alive during this whole step)
+          foreach($p in @('qbittorrent','qbittorrent-nox')){ Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+          Start-Sleep -Seconds 4
           "flush"|Out-File $cfg.flushFlag -Encoding ascii -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 15
           $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak')
           $done=@{}; if(Test-Path $cfg.doneFile){ Get-Content $cfg.doneFile | %{$done[$_]=$true} }
-          $idx=Load-Index $cfg; $deadline=(Get-Date).AddSeconds(220)
+          $idx=Load-Index $cfg
+          # 2) bounded but generous window (GitHub cancel grace). No per-file skip on lock - read-only shared open handles it.
+          $deadline=(Get-Date).AddMinutes(12)
           foreach($r in $cfg.roots){
-            if((Get-Date) -gt $deadline){ break }
+            if((Get-Date) -gt $deadline){ Write-Host "deadline reached, stopping."; break }
             if(-not (Test-Path $r.path)){ continue }
-            $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending}
+            $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Sort-Object Length -Descending}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending}
             foreach($fi in $items){
               if((Get-Date) -gt $deadline){ break }
               if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}
               if($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}
-              if(Is-Locked $fi.FullName){continue}
               $safe=$fi.Name -replace '\|','_'; $ex=$idx | ?{$_.name -eq $safe -and $_.src -eq $r.tag} | select -First 1
               if(-not $ex){ $ex=@{name=$safe;src=$r.tag;status='uploading';payload='';gofile='';time=(Get-Date -f 'HH:mm:ss')}; [void]$idx.Add($ex) }
-              $enc=Join-Path $env:TEMP ('em_'+[guid]::NewGuid().ToString('N')+'.enc'); Encrypt-File $fi.FullName $enc $cfg.decPw
-              $gf=Upload-Gofile $enc; Remove-Item $enc -Force -ErrorAction SilentlyContinue
-              if($gf){ $ex.payload=B64U ($gf+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gf; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; "[$(Get-Date -f o)] EMERGENCY OK $($fi.Name)"|Out-File $cfg.logFile -Append }
+              $enc=Join-Path $env:TEMP ('em_'+[guid]::NewGuid().ToString('N')+'.enc'); $gf=$null
+              try { Encrypt-File $fi.FullName $enc $cfg.decPw; $gf=Upload-Gofile $enc } catch { "EMERGENCY err $($fi.Name): $_" | Out-File $cfg.logFile -Append }
+              Remove-Item $enc -Force -ErrorAction SilentlyContinue
+              if($gf){ $ex.payload=B64U ($gf+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gf; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; "[$(Get-Date -f o)] EMERGENCY OK $($fi.Name) ($($fi.Length) bytes)"|Out-File $cfg.logFile -Append }
               else { $ex.status='limit'; "[$(Get-Date -f o)] EMERGENCY LIMIT $($fi.Name)"|Out-File $cfg.logFile -Append }
             }
           }
           Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null
-          Write-Host "EMERGENCY pass done."
+          Write-Host "EMERGENCY pass done. (If you pressed Cancel a 2nd time, GitHub force-kills and the VM is reclaimed immediately.)"
 
       - name: Secure Cleanup (wipe all data)
         if: ${{ always() }}
         run: |
-          $ml=Join-Path $env:TEMP 'ghrdp_mirror.log'; if(Test-Path $ml){ Write-Host "----- mirror log (tail) -----"; Get-Content $ml -Tail 80 | %{Write-Host $_} }
+          $ml=Join-Path $env:TEMP 'ghrdp_mirror.log'; if(Test-Path $ml){ Write-Host "----- mirror log (tail) -----"; Get-Content $ml -Tail 100 | %{Write-Host $_} }
           $pidf=Join-Path $env:RUNNER_TEMP 'ghrdp_watcher.pid'; if(Test-Path $pidf){ $wid=(Get-Content $pidf -Raw).Trim(); if($wid){Stop-Process -Id $wid -Force -ErrorAction SilentlyContinue} }
-          foreach($p in @('chrome','msedge','firefox','iexplore','brave','opera')){ Get-Process -Name $p -ErrorAction SilentlyContinue|Stop-Process -Force -ErrorAction SilentlyContinue }
+          foreach($p in @('chrome','msedge','firefox','iexplore','brave','opera','qbittorrent')){ Get-Process -Name $p -ErrorAction SilentlyContinue|Stop-Process -Force -ErrorAction SilentlyContinue }
           Start-Sleep -Seconds 3
           foreach($p in @("$env:LOCALAPPDATA\Google\Chrome\User Data","$env:LOCALAPPDATA\Microsoft\Edge\User Data","$env:APPDATA\Mozilla\Firefox\Profiles","$env:LOCALAPPDATA\Mozilla\Firefox\Profiles","$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data","$env:APPDATA\Opera Software\Opera Stable")){ if(Test-Path $p){ try{Remove-Item -Path $p -Recurse -Force -ErrorAction Stop}catch{Start-Sleep 2;Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue} } }
           foreach($p in @("$env:USERPROFILE\Downloads","$env:USERPROFILE\Desktop","$env:USERPROFILE\Documents")){ if(Test-Path $p){Remove-Item "$p\*" -Recurse -Force -ErrorAction SilentlyContinue} }
