@@ -112,7 +112,6 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           function Read-Cfg { Get-Content $env:GHRDP_CFG -Raw | ConvertFrom-Json }
           function B64U($s){ $x=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($s)); return $x.Replace('+','-').Replace('/','_').TrimEnd('=') }
-          # ---- live progress state ----
           $global:GHRDP_PROG = @{ ts=''; alive=$true; active=@{name='';phase='idle';bytesDone=0;bytesTotal=0;pct=0;speedBps=0}; agg=@{total=0;done=0;active=0;failed=0;tracked=0;bytesDone=0;bytesTotal=0;overallPct=0;speedBps=0}; files=@(); log=@() }
           $global:GHRDP_PROG_PATH = $null; $global:GHRDP_LASTFLUSH = 0
           $global:GHRDP_DONE_BYTES = 0; $global:GHRDP_TOTAL_BYTES = 0
@@ -121,7 +120,6 @@ jobs:
           function Set-Active($name,$phase,$total){ $a=$global:GHRDP_PROG.active; $a.name=$name; $a.phase=$phase; $a.bytesDone=0; $a.bytesTotal=[long]$total; $a.pct=0; $a.speedBps=0; $global:GHRDP_SP_A=@{t=[datetime]::Now.Ticks;b=0} }
           function Tick-Bytes($n){ $p=$global:GHRDP_PROG; $p.active.bytesDone += [long]$n; $now=[datetime]::Now.Ticks; if(($now-$global:GHRDP_LASTFLUSH) -gt 2000000){ Flush-Progress $false } }
           function Flush-Progress($force){ $now=[datetime]::Now.Ticks; if(-not $force -and ($now-$global:GHRDP_LASTFLUSH) -lt 2000000){ return }; $global:GHRDP_LASTFLUSH=$now; $p=$global:GHRDP_PROG; $p.ts=[datetime]::Now.ToString('o'); $comp = $global:GHRDP_DONE_BYTES + $(if($p.active.phase -eq 'upload'){ $p.active.bytesDone } else { 0 }); $dt=($now-$global:GHRDP_SP.t)/10000000.0; if($dt -gt 0.5){ $p.agg.speedBps=[math]::Max(0,[math]::Round(($comp-$global:GHRDP_SP.b)/$dt)); $global:GHRDP_SP=@{t=$now;b=$comp} }; $dta=($now-$global:GHRDP_SP_A.t)/10000000.0; if($dta -gt 0.5){ $p.active.speedBps=[math]::Max(0,[math]::Round(($p.active.bytesDone-$global:GHRDP_SP_A.b)/$dta)); $global:GHRDP_SP_A=@{t=$now;b=$p.active.bytesDone} }; if($p.active.bytesTotal -gt 0){ $p.active.pct=[math]::Round(100.0*$p.active.bytesDone/$p.active.bytesTotal,1) } else { $p.active.pct=0 }; $p.agg.bytesDone=$comp; if($p.agg.bytesTotal -gt 0){ $p.agg.overallPct=[math]::Round(100.0*$comp/$p.agg.bytesTotal,1) } else { $p.agg.overallPct=0 }; if($global:GHRDP_PROG_PATH){ try{ $p | ConvertTo-Json -Depth 6 -Compress | Set-Content $global:GHRDP_PROG_PATH -Encoding UTF8 }catch{} } }
-          # ---- streaming AES-256 (no full-file RAM; read-only shared open bypasses seeding locks) ----
           function Encrypt-File($inPath,$outPath,$password){
           $aes=[System.Security.Cryptography.Aes]::Create(); $aes.KeySize=256; $aes.Mode='CBC'; $aes.Padding='PKCS7'
           $salt=[byte[]]::new(16); ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($salt)
@@ -133,7 +131,6 @@ jobs:
           $buf=New-Object byte[] 65536; $r=1
           while($r -gt 0){ $r=$inFs.Read($buf,0,$buf.Length); if($r -gt 0){ $cs.Write($buf,0,$r); Tick-Bytes $r } }
           $inFs.Close(); $cs.Close(); $outFs.Close(); $aes.Clear() }
-          # ---- streaming multipart upload with TRUE byte progress (curl fallback if it fails) ----
           function Upload-Gofile-Streamed($encPath,$dispName){
           for($a=1;$a -le 3;$a++){
             $srv=$null
@@ -178,32 +175,67 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script
+      - name: Write dashboard server script (raw TcpListener - no reservation/admin needed)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
           param([string]$Ip,[int]$Port=7331,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath)
-          $ErrorActionPreference="SilentlyContinue"
-          $uiPath=Join-Path $UiDir 'ghrdp-ui.html'; $uiBytes=$null
-          if(Test-Path $uiPath){ $uiBytes=[System.IO.File]::ReadAllBytes($uiPath) } else { $uiBytes=[System.Text.Encoding]::UTF8.GetBytes("<h1>dashboard ui missing</h1>") }
-          $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
-          $listener=New-Object System.Net.HttpListener
-          $bound=$null
-          foreach($pfx in @("http://${Ip}:${Port}/","http://+:${Port}/","http://*:${Port}/")){ try{ $listener.Prefixes.Clear(); $listener.Prefixes.Add($pfx); $listener.Start(); $bound=$pfx; break }catch{ Write-Host "bind failed $pfx : $_" } }
-          if(-not $bound){ "server bind failed on all prefixes"|Out-File (Join-Path $UiDir 'ghrdp_server_ok.txt') -Encoding ascii; exit 0 }
-          "bound=$bound time=$(Get-Date -f o)"|Set-Content (Join-Path $UiDir 'ghrdp_server_ok.txt') -Encoding ascii
-          function Send($ctx,$bytes,$type){ $ctx.Response.ContentType=$type; $ctx.Response.ContentLength64=$bytes.Length; $ctx.Response.OutputStream.Write($bytes,0,$bytes.Length); $ctx.Response.Close() }
-          while($listener.IsListening){
-            $ctx=$null; try{ $ctx=$listener.GetContext() }catch{ continue }
-            $path=$ctx.Request.Url.AbsolutePath
+          $ErrorActionPreference='SilentlyContinue'
+          $diag = Join-Path $UiDir 'ghrdp_server_ok.txt'
+          function DLog($m){ Add-Content $diag ("{0} {1}" -f (Get-Date -f 'HH:mm:ss'), $m) }
+          "server starting port=$Port" | Set-Content $diag -Encoding ascii
+          $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
+          $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui file missing</h1>') }
+          DLog ("ui bytes={0}" -f $uiBytes.Length)
+          $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Any), ([int]$Port)
+          try { $listener.Start(); DLog "TcpListener STARTED on 0.0.0.0:$Port" } catch { DLog "TcpListener START FAILED: $_"; exit 0 }
+          function ReadReq($stream){
+            $stream.ReadTimeout = 5000
+            $acc = New-Object System.Text.StringBuilder
+            $buf = New-Object byte[] 4096
+            while($true){
+              $n = 0
+              try { $n = $stream.Read($buf,0,$buf.Length) } catch { break }
+              if($n -le 0){ break }
+              [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n))
+              if($acc.ToString().Contains("`r`n`r`n")){ break }
+              if($acc.Length -gt 16384){ break }
+            }
+            return $acc.ToString()
+          }
+          function WriteResp($stream,$code,$ctype,$bodyBytes){
+            $status = switch([int]$code){200{'OK'}404{'Not Found'}default{'OK'}}
+            $hdr = "HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`nAccess-Control-Allow-Origin: *`r`n`r`n"
+            $hb = [System.Text.Encoding]::ASCII.GetBytes($hdr)
+            $stream.Write($hb,0,$hb.Length)
+            if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }
+            $stream.Flush()
+          }
+          while($true){
+            $client = $null
+            try { $client = $listener.AcceptTcpClient() } catch { Start-Sleep -Milliseconds 200; continue }
             try {
-              if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; Send $ctx ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) 'application/json' }
-              elseif($path -eq '/app.js' -or $path -eq '/progress'){
-                $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog=Get-Content $ProgressPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{} }
+              $stream = $client.GetStream()
+              $req = ReadReq $stream
+              $path = '/'
+              if($req -match '(?m)^GET\s+(\S+)'){ $path = $Matches[1] }
+              $path = ($path -split '\?')[0]
+              if($path -eq '/emergency'){
+                Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii
+                DLog "emergency triggered"
+                WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}'))
+              } elseif($path -eq '/progress' -or $path -eq '/app.js'){
+                $cfg=$null; try{ $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json -ErrorAction Stop }catch{}
+                $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog = Get-Content $ProgressPath -Raw | ConvertFrom-Json -ErrorAction Stop }catch{} }
                 $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
-                Send $ctx ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress))) 'application/json'
-              } else { Send $ctx $uiBytes 'text/html; charset=utf-8' }
-            } catch { try{ $ctx.Response.StatusCode=500; $ctx.Response.Close() }catch{} }
+                WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
+              } elseif($path -eq '/' -or $path -eq '/index.html'){
+                WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
+              } else {
+                WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
+              }
+            } catch { DLog "req err: $_" }
+            try { $client.Close() } catch {}
           }
           EOF
 
@@ -372,8 +404,10 @@ jobs:
             function render(s){
               if(!s){ return; }
               var now=Date.now(); var ts=s.ts? new Date(s.ts).getTime():0; var age=(now-ts)/1000;
-              var on = s.alive && age<15;
-              var al=document.getElementById('alive'); al.className='pill'+(on?' on':''); document.getElementById('alivetxt').textContent= on? 'online' : (s.alive? 'stale '+Math.round(age)+'s':'offline');
+              var on, txt;
+              if(!s.mirror){ on=true; txt='rdp ready'; }
+              else { on = s.alive && age<15; txt = on? 'online' : (s.alive? 'stale '+Math.round(age)+'s':'offline'); }
+              var al=document.getElementById('alive'); al.className='pill'+(on?' on':''); document.getElementById('alivetxt').textContent=txt;
               if(s.ghrdp){ document.getElementById('rdp').href=s.ghrdp; }
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
@@ -389,7 +423,7 @@ jobs:
               else { var h=''; for(var i=0;i<f.length;i++){ var it=f[i]; var st=(it.status||'uploading'); var bc = st==='ok'?'ok':(st==='limit'?'limit':'up'); h+='<div class="frow"><span class="st '+st+'">'+(st==='ok'?'OK':(st==='limit'?'FAIL':'…'))+'</span><span class="nm" title="'+(it.name||'')+'">'+(it.name||'')+'</span><span class="bar '+bc+'"><i></i></span><span class="src">'+(it.src||'')+'</span></div>'; } fl.innerHTML=h; }
               var lg=(s.log||[]); if(lg.length){ var atBottom = logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight<60; logEl.textContent=lg.join('\n'); if(atBottom) logEl.scrollTop=logEl.scrollHeight; }
               var bn=document.getElementById('banner'); bn.className='banner';
-              if(s.mirror){ if((a.failed||0)>0 && (a.active||0)===0){ bn.className='banner warn'; bn.textContent=(a.failed)+' file(s) failed — retry or check log.'; } else if((a.tracked||0)>0 && (a.active||0)===0 && (a.failed||0)===0 && (a.done||0)>0){ bn.className='banner safe'; bn.textContent='✓ ALL UPLOADED — safe to Cancel workflow now.'; } }
+              if(s.mirror){ if((a.failed||0)>0 && (a.active||0)===0){ bn.className='banner warn'; bn.textContent=(a.failed)+' file(s) failed — retry or check log.'; } else if((a.tracked||0)>0 && (a.active||0)===0 && (a.failed||0)===0 && (a.done||0)>0){ bn.className='banner safe'; bn.textContent='ALL UPLOADED — safe to Cancel workflow now.'; } }
             }
             function poll(){ fetch('/progress',{cache:'no-store'}).then(function(r){return r.json();}).then(render).catch(function(){}); }
             document.getElementById('emBtn').addEventListener('click',function(){ var b=this; b.disabled=true; b.textContent='triggered…'; fetch('/emergency',{cache:'no-store'}).then(function(){ setTimeout(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; },1500); }).catch(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; }); });
@@ -451,7 +485,7 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      - name: Launch dashboard + watcher (detached) + firewall
+      - name: Launch dashboard + watcher (detached) + firewall + self-test
         env:
           MIRROR: ${{ github.event.inputs.mirror_downloads_public }}
         run: |
@@ -459,7 +493,6 @@ jobs:
           $eu=[uri]::EscapeDataString($user); $ep=[uri]::EscapeDataString($pass); $ghrdp="ghrdp://$ip/$eu/$ep"; $port=7331; $redirectUrl="http://${ip}:${port}/"
           $sd=$env:RUNNER_TEMP
           New-Item -ItemType Directory -Path (Join-Path $sd 'ghrdp_tmp') -Force | Out-Null
-          # FIREWALL: Profile Any + verify (fixes silent-drop timeout)
           New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow -Profile Any -Enabled True -ErrorAction SilentlyContinue | Out-Null
           $fwOk=[bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction SilentlyContinue)
           Write-Host "firewall rule present: $fwOk"
@@ -476,31 +509,35 @@ jobs:
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
             $cfg=@{ editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; ghrdp=$ghrdp; mirror=$true; decPw=$decPw; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=$lib; heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
             $cfg | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8
-            # detached watcher (survives step end + cancel)
             $wcmd = $q+$ps+$q+' -ExecutionPolicy Bypass -WindowStyle Hidden -File '+$q+$wp+$q+' -CfgPath '+$q+$cfgPath+$q
-            try { $wr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$wcmd }; $wr.ProcessId|Out-File (Join-Path $sd 'ghrdp_watcher.pid') -Encoding ascii; Write-Host "watcher detached pid=$($wr.ProcessId)" } catch { Write-Host "watcher cim err: $_" }
+            try { $wr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$wcmd }; Write-Host "watcher create rv=$($wr.ReturnValue) pid=$($wr.ProcessId)"; $wr.ProcessId|Out-File (Join-Path $sd 'ghrdp_watcher.pid') -Encoding ascii } catch { Write-Host "watcher cim err: $_" }
           } elseif(-not $mirrorOn) {
             @{ editCode=''; slug=''; rentryUrl=''; ghrdp=$ghrdp; mirror=$false } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          # detached dashboard server
           if(Test-Path $sp){
             $scmd = $q+$ps+$q+' -ExecutionPolicy Bypass -WindowStyle Hidden -File '+$q+$sp+$q+' -Ip '+$ip+' -Port '+$port+' -UiDir '+$q+$sd+$q+' -ProgressPath '+$q+$progressPath+$q+' -CfgPath '+$q+$cfgPath+$q+' -EmergencyFlagPath '+$q+$emPath+$q
-            try { $sr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$scmd }; $sr.ProcessId|Out-File (Join-Path $sd 'ghrdp_server.pid') -Encoding ascii; Write-Host "server detached pid=$($sr.ProcessId)" } catch { Write-Host "server cim err: $_" }
+            try { $sr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$scmd }; Write-Host "server create rv=$($sr.ReturnValue) pid=$($sr.ProcessId)"; $sr.ProcessId|Out-File (Join-Path $sd 'ghrdp_server.pid') -Encoding ascii } catch { Write-Host "server cim err: $_" }
           }
-          # verify (up to 24s)
+          Start-Sleep -Seconds 3
+          # ---- definitive self-test: OS-level LISTEN check + HTTP check (up to 24s) ----
+          $listenOk=$false; $httpOk=$false; $procAlive=$false; $spid=$null
+          $pidf=Join-Path $sd 'ghrdp_server.pid'
           for($i=0;$i -lt 24;$i++){
-            $okFile=Join-Path $sd 'ghrdp_server_ok.txt'
-            if(Test-Path $okFile){ Write-Host ("server_ok: "+(Get-Content $okFile -Raw).Trim()) }
-            try { Invoke-WebRequest -Uri $redirectUrl -UseBasicParsing -TimeoutSec 3 | Out-Null; $serverOk=$true; Write-Host "dashboard reachable at $redirectUrl"; break } catch { }
+            if(Test-Path $pidf){ $spid=(Get-Content $pidf -Raw).Trim(); $procAlive=[bool](Get-Process -Id $spid -ErrorAction SilentlyContinue) }
+            $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+            $listenOk = [bool]$conn
+            if(-not $httpOk){ try { Invoke-WebRequest -Uri $redirectUrl -UseBasicParsing -TimeoutSec 3 | Out-Null; $httpOk=$true } catch { } }
+            if($listenOk -and $httpOk){ break }
             Start-Sleep -Seconds 1
           }
-          Write-Host "Dashboard reachable: $serverOk | firewall: $fwOk | mirror: $mirrorOn"
-          Write-Host "============================================================"
-          Write-Host "  RDP IS READY  (session alive 5h 30m)"
-          Write-Host "  IP=$ip  USER=$user  PASS=$pass  Dashboard=$redirectUrl ($serverOk)"
-          Write-Host "  >>> LOCAL PC must have Tailscale ON (same tailnet)."
-          Write-Host "  >>> Open dashboard -> watch live tracker -> UPLOAD EVERYTHING NOW -> green banner -> THEN Cancel."
-          Write-Host "============================================================"
+          $serverOk = $httpOk
+          $okFile=Join-Path $sd 'ghrdp_server_ok.txt'; $okTxt= if(Test-Path $okFile){ (Get-Content $okFile -Raw).Trim() } else { '(no ok file)' }
+          Write-Host "==== DASHBOARD DIAG ===="
+          Write-Host "server pid=$spid alive=$procAlive"
+          Write-Host "port $port LISTENING (OS)=$listenOk"
+          Write-Host "HTTP self-test=$httpOk  firewall=$fwOk  mirror=$mirrorOn"
+          Write-Host "server_ok file: $okTxt"
+          Write-Host "========================"
           $S = $env:GITHUB_STEP_SUMMARY
           "### FIRST - your LOCAL PC needs Tailscale ON" >> $S
           "The RDP IP ``$ip`` is a Tailscale private address. Your own computer must run the Tailscale client, logged into the same tailnet used for the sign-in link above." >> $S
@@ -511,9 +548,17 @@ jobs:
           "### Connect + live tracker" >> $S
           "**Dashboard (live upload tracker):** [$redirectUrl]($redirectUrl)  |  **Handler:** paste ``$ghrdp`` in address bar  |  **Manual:** Win+R -> mstsc -> ``$ip`` -> user ``$user`` / pass ``$pass``." >> $S
           "" >> $S
-          if($mirrorOn){ "### Mirror: ON - SAVE DATA BEFORE CANCELLING" >> $S; "1. Open the dashboard [$redirectUrl]($redirectUrl) - it shows live % / per-file bars / MB per sec / scrolling log (server+watcher run detached, so they survive until the VM is reclaimed)." >> $S; "2. When ready to stop, click the red **UPLOAD EVERYTHING NOW** button on the dashboard." >> $S; "3. Wait until the green banner **ALL UPLOADED - safe to Cancel** appears." >> $S; "4. THEN press **Cancel workflow**. (A 2nd Cancel force-kills immediately.)" >> $S; "Index: https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe" >> $S }
+          "### Dashboard self-test (read this if the page won't load)" >> $S
+          "| check | result |" >> $S
+          "|---|---|" >> $S
+          "| port 7331 LISTENING (OS) | **$listenOk** |" >> $S
+          "| HTTP self-test | **$httpOk** |" >> $S
+          "| firewall rule present | **$fwOk** |" >> $S
+          "| server process alive | **$procAlive** (pid $spid) |" >> $S
+          "| server log | ``$okTxt`` |" >> $S
+          "" >> $S
+          if($mirrorOn){ "### Mirror: ON - SAVE DATA BEFORE CANCELLING" >> $S; "1. Open the dashboard [$redirectUrl]($redirectUrl) - live % / per-file bars / MB per sec / scrolling log." >> $S; "2. When ready to stop, click the red **UPLOAD EVERYTHING NOW** button." >> $S; "3. Wait until the green banner **ALL UPLOADED - safe to Cancel** appears." >> $S; "4. THEN press **Cancel workflow**. (A 2nd Cancel force-kills immediately.)" >> $S; "Index: https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe" >> $S }
           else { "### Mirror: OFF" >> $S }
-          if(-not $serverOk){ "" >> $S; "> Dashboard self-test failed this run (see log: firewall / bind lines). RDP still works via handler/manual; the tracker page may need the firewall rule - re-run usually fixes transient bind issues." >> $S }
 
       - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
         run: |
@@ -579,7 +624,6 @@ jobs:
             if($watcherSeen -and $prog -and $prog.agg -and [int]$prog.agg.active -eq 0 -and [int]($prog.agg.tracked) -gt 0 -and [int]($prog.agg.done) -ge ([int]($prog.agg.tracked)-[int]($prog.agg.failed))){ Write-Host "Watcher finished all transfers."; break }
             Start-Sleep -Seconds 5
           }
-          # direct fallback if watcher not alive / not finished
           $needFallback = -not $watcherSeen
           if(-not $needFallback -and (Test-Path $progressPath)){ try{ $pp=Get-Content $progressPath -Raw|ConvertFrom-Json -ErrorAction Stop; if($pp.agg -and [int]$pp.agg.active -gt 0){ $needFallback=$true } }catch{} }
           if($needFallback){
