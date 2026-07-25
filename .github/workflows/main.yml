@@ -74,7 +74,7 @@ jobs:
           if (-not $authed) { throw "Sign-in timeout." }
           Write-Host "Tailscale connected. IP = $((& $ts ip -4).Trim())"
 
-      - name: Enable RDP + harden
+      - name: Enable RDP + harden + open dashboard port (all profiles)
         run: |
           $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
           Set-ItemProperty -Path $rdp -Name "fDenyTSConnections" -Value 0
@@ -83,8 +83,10 @@ jobs:
           Set-ItemProperty -Path "$rdp\WinStations\RDP-Tcp" -Name "MinEncryptionLevel" -Value 3
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Direction Inbound -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
-          # dashboard port open to the Tailscale network (so your LOCAL pc can reach it)
-          New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort 7331 -Protocol TCP -Action Allow -Profile Any -RemoteAddress '100.64.0.0/10' -Enabled True -ErrorAction SilentlyContinue | Out-Null
+          # dashboard port: maximally permissive on the VM (only reachable path is Tailscale/Funnel anyway)
+          Remove-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort 7331 -Protocol TCP -Action Allow -Profile Any -Enabled True -ErrorAction SilentlyContinue | Out-Null
+          & netsh.exe advfirewall firewall add rule name="ghrdp-dash-netsh" dir=in action=allow protocol=TCP localport=7331 enable=yes | Out-Null; $LASTEXITCODE=0
           & net.exe accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 2>$null | Out-Null; $LASTEXITCODE = 0
 
       - name: Create secure random RDP account + D-RDP-Storage
@@ -111,16 +113,13 @@ jobs:
           $user = $env:RDP_USER; $pass = $env:RDP_PASS
           Write-Host "============================================================"
           Write-Host "  RDP CREDENTIALS  (this step is FINISHED -> expandable now)"
-          Write-Host "  IP   = $ip"
-          Write-Host "  USER = $user"
-          Write-Host "  PASS = $pass"
+          Write-Host "  IP   = $ip   USER = $user   PASS = $pass"
           Write-Host "------------------------------------------------------------"
-          Write-Host "  DASHBOARD FROM YOUR LOCAL PC (Tailscale ON, same tailnet):"
-          Write-Host "        http://${ip}:7331/"
-          Write-Host "  DASHBOARD FROM INSIDE RDP (after double-click Mission"
-          Write-Host "        Control icon):  http://127.0.0.1:7331/  OR  http://${ip}:7331/"
-          Write-Host "  NOTE: 127.0.0.1 on YOUR pc = your own pc, NOT the runner."
-          Write-Host "        From your pc always use the Tailscale IP above."
+          Write-Host "  LOCAL PC DASHBOARD = the FUNNEL link printed by the"
+          Write-Host "  'Mission Control' console inside RDP (copy it there)."
+          Write-Host "  It looks like:  https://<runner>.<tail>.ts.net/?key=...."
+          Write-Host "  (127.0.0.1 on your pc = your own pc -> never works here.)"
+          Write-Host "  INSIDE RDP: double-click desktop icon 'Mission Control'."
           Write-Host "============================================================"
 
       - name: Write mirror lib (shared functions)
@@ -195,7 +194,7 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (binds 0.0.0.0 + /diag self-test endpoint)
+      - name: Write dashboard server script (token gate + funnel-aware + accurate diag)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
@@ -204,47 +203,48 @@ jobs:
           $ErrorActionPreference='SilentlyContinue'
           $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
           $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui missing</h1>') }
+          function ParseHeaders($raw){
+            $h=@{}; $lines=$raw -split "`r`n"; for($i=1;$i -lt $lines.Length;$i++){ $l=$lines[$i]; $ix=$l.IndexOf(':'); if($ix -gt 0){ $h[($l.Substring(0,$ix).Trim().ToLower())]=$l.Substring($ix+1).Trim() } }
+            $qp=@{}; if($lines[0] -match '\?(.+)\s'){ foreach($kv in ($Matches[1] -split '&')){ $p=$kv -split '='; if($p.Length -eq 2){ $qp[$p[0].ToLower()]=[uri]::UnescapeDataString($p[1]) } } }
+            return @{ headers=$h; query=$qp }
+          }
+          function IsLoopbackHost($parsed){
+            $host_ = $parsed.headers['host']; if($host_){ $host_ = ($host_ -split ':')[0] }
+            $xfh = $parsed.headers['x-forwarded-host']; $xff = $parsed.headers['x-forwarded-for']
+            $loopHost = ($host_ -eq '127.0.0.1') -or ($host_ -eq 'localhost') -or ($host_ -eq '[::1]')
+            return ($loopHost -and -not $xfh -and -not $xff)
+          }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
-          function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`nAccess-Control-Allow-Origin: *`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
-          function BuildDiag($cfg){
+          function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}401{'Unauthorized'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
+          function BuildDiag($cfg,$parsed){
             $bindOk = $true
             $fw = $false; try { $fw = [bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction Stop) } catch {}
-            $tsip = ''; try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {}
+            $tsip = $cfg.rdpIp; if(-not $tsip){ try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {} }
             $selfConnect = $false; $selfErr = ''
-            if($tsip){ try { Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfConnect = $true } catch { $selfErr = "$_" } }
-            $progReadable = $false; try { if(Test-Path $ProgressPath){ Get-Content $ProgressPath -Raw -EA Stop | Out-Null; $progReadable = $true } } catch {}
+            if($tsip){ try { Invoke-WebRequest -Uri ("http://{0}:{1}/?key={2}" -f $tsip,$Port,$cfg.dashToken) -UseBasicParsing -TimeoutSec 4 | Out-Null; $selfConnect = $true } catch { $selfErr = "$_" } }
             $listen = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+            $loopback = IsLoopbackHost $parsed
             return [ordered]@{
-              bindAddress = $BindAddress
-              bindOk = $bindOk
-              portListening = $listen
-              firewallRulePresent = $fw
-              tailscaleIp = $tsip
-              selfConnectFromVmViaTailscaleIp = $selfConnect
-              selfConnectError = $selfErr
-              progressFileReadable = $progReadable
-              mirror = [bool]$(if($cfg){$cfg.mirror}else{$false})
-              dashboardFromLocalPc = ("http://{0}:{1}/" -f $tsip,$Port)
-              dashboardFromInsideRdp = ("http://127.0.0.1:{0}/  or  http://{1}:{0}/" -f $Port,$tsip)
-              hints = @(
-                "FROM YOUR LOCAL PC: open http://{0}:{1}/  (NOT 127.0.0.1 - that is your own pc)." -f $tsip,$Port,
-                "Your LOCAL pc must have Tailscale ON and be in the SAME tailnet as this runner.",
-                "If local pc still fails: this VM firewall rule 'ghrdp-dash' present = $fw (must be True).",
-                "If selfConnectFromVmViaTailscaleIp = False: the bind or firewall is blocking the Tailscale interface.",
-                "127.0.0.1 works ONLY from inside the RDP desktop (it is the VM loopback)."
-              )
+              bindAddress = $BindAddress; bindOk = $bindOk; portListening = $listen; firewallRulePresent = $fw
+              tailscaleIp = $tsip; selfConnectFromVmViaTailscaleIp = $selfConnect; selfConnectError = $selfErr
+              funnelUrl = $(if($cfg.funnelUrl){$cfg.funnelUrl}else{'(funnel not enabled - see Mission Control console)'})
+              requestCameViaLoopback = $loopback; requestHost = $parsed.headers['host']
+              note = "Direct Tailscale-IP access from a local pc is blocked by GitHub runner network policy. Use the FUNNEL url (token-gated) for local-pc access; use 127.0.0.1 only inside RDP."
             }
           }
           function HandleOne($client){
             try {
-              $stream=$client.GetStream(); $req=ReadReq $stream; $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=$Matches[1] }; $path=($path -split '\?')[0]
+              $stream=$client.GetStream(); $req=ReadReq $stream; $parsed=ParseHeaders $req
+              $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=($Matches[1] -split '\?')[0] }
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
+              $loop = IsLoopbackHost $parsed
+              $keyOk = $loop -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
+              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - missing or bad ?key=. Open the FUNNEL link copied from the Mission Control console inside RDP (it includes ?key=...)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
               if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
-              elseif($path -eq '/diag'){ $d = BuildDiag $cfg; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress))) }
+              elseif($path -eq '/diag'){ $d = BuildDiag $cfg $parsed; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress))) }
               elseif($path -eq '/progress' -or $path -eq '/app.js'){
                 $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog=Get-Content $ProgressPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{} }
-                $tsip=''; try{ $tsip=(& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() }catch{}
-                $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); tailscaleIp=$tsip; localPcUrl=("http://{0}:{1}/" -f $tsip,$Port); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
+                $obj=[ordered]@{ serverTs=(Get-Date -f o); viaLoopback=$loop; funnelUrl=$(if($cfg.funnelUrl){$cfg.funnelUrl}else{''}); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
               } else { WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes }
             } catch { }
@@ -262,7 +262,7 @@ jobs:
           }
           EOF
 
-      - name: Write dashboard UI (live tracker + creds + DIAGNOSE button)
+      - name: Write dashboard UI (mode badge + local-pc funnel link + tracker + creds)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-ui.html" <<'UIEOF'
@@ -277,32 +277,36 @@ jobs:
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
           <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
           <style>
-          :root{ --bg:#0a0e12; --panel:#11171d; --panel2:#0d1217; --line:#223039; --ink:#e9eef3; --mut:#8aa0ad; --teal:#37c6b0; --teal-d:#0c3b34; --amber:#f0a830; --red:#e0533d; --green:#3ecf8e; --mono:'JetBrains Mono',ui-monospace,monospace; --disp:'Space Grotesk',system-ui,sans-serif; --body:'IBM Plex Sans',system-ui,sans-serif; }
+          :root{ --bg:#0a0e12; --panel:#11171d; --panel2:#0d1217; --line:#223039; --ink:#e9eef3; --mut:#8aa0ad; --teal:#37c6b0; --teal-d:#0c3b34; --amber:#f0a830; --red:#e0533d; --green:#3ecf8e; --violet:#8b7bf0; --mono:'JetBrains Mono',ui-monospace,monospace; --disp:'Space Grotesk',system-ui,sans-serif; --body:'IBM Plex Sans',system-ui,sans-serif; }
           *{box-sizing:border-box;margin:0;padding:0}
           html,body{height:100%}
           body{ font-family:var(--body); color:var(--ink); background:var(--bg); min-height:100vh; padding:18px; position:relative; overflow-x:hidden;
             background-image:
               radial-gradient(900px 500px at 12% -8%, rgba(55,198,176,.10), transparent 60%),
-              radial-gradient(800px 600px at 100% 110%, rgba(240,168,48,.07), transparent 55%),
+              radial-gradient(800px 600px at 100% 110%, rgba(139,123,240,.08), transparent 55%),
               linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px),
               linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
             background-size:auto,auto,26px 26px,26px 26px; }
-          body::before{ content:""; position:fixed; inset:0 0 auto 0; height:3px; background:linear-gradient(90deg,var(--teal),var(--amber),var(--red)); opacity:.85; }
+          body::before{ content:""; position:fixed; inset:0 0 auto 0; height:3px; background:linear-gradient(90deg,var(--teal),var(--violet),var(--amber)); opacity:.85; }
           .wrap{ max-width:1180px; margin:0 auto; }
-          header{ display:flex; align-items:center; justify-content:space-between; gap:14px; padding:6px 2px 18px; border-bottom:1px solid var(--line); margin-bottom:18px; }
+          header{ display:flex; align-items:center; justify-content:space-between; gap:14px; padding:6px 2px 18px; border-bottom:1px solid var(--line); margin-bottom:18px; flex-wrap:wrap; }
           .brand{ display:flex; align-items:baseline; gap:12px; }
           .brand h1{ font-family:var(--disp); font-weight:700; font-size:22px; letter-spacing:-.4px; }
           .brand .tag{ font-family:var(--mono); font-size:11px; color:var(--mut); letter-spacing:.12em; text-transform:uppercase; }
-          .hstat{ display:flex; align-items:center; gap:12px; font-family:var(--mono); font-size:12px; color:var(--mut); }
-          .pill{ display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border-radius:999px; border:1px solid var(--line); font-weight:600; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+          .hstat{ display:flex; align-items:center; gap:10px; font-family:var(--mono); font-size:12px; color:var(--mut); flex-wrap:wrap; }
+          .pill{ display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border-radius:999px; border:1px solid var(--line); font-weight:600; font-size:11px; letter-spacing:.08em; text-transform:uppercase; transition:all .2s ease; }
           .pill .d{ width:8px; height:8px; border-radius:50%; background:var(--red); }
           .pill.on{ color:var(--teal); border-color:var(--teal-d); }
           .pill.on .d{ background:var(--teal); animation:pulse 1.4s infinite; }
-          .diagbtn{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; background:#16202a; color:var(--amber); border:1px solid #5a4414; border-radius:8px; padding:6px 10px; cursor:pointer; }
+          .mode{ padding:5px 11px; border-radius:999px; border:1px solid var(--line); font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; }
+          .mode.loop{ color:var(--teal); border-color:var(--teal-d); }
+          .mode.funnel{ color:var(--violet); border-color:#33305a; }
+          .diagbtn{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; background:#16202a; color:var(--amber); border:1px solid #5a4414; border-radius:8px; padding:6px 10px; cursor:pointer; transition:background .15s ease; }
           .diagbtn:hover{ background:#241c0c; }
           @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(55,198,176,.55)} 70%{box-shadow:0 0 0 9px rgba(55,198,176,0)} 100%{box-shadow:0 0 0 0 rgba(55,198,176,0)} }
           .grid{ display:grid; grid-template-columns:1.45fr 1fr; gap:16px; }
-          .panel{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line); border-radius:16px; padding:20px; position:relative; overflow:hidden; }
+          .panel{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line); border-radius:16px; padding:20px; position:relative; overflow:hidden; transition:border-color .2s ease; }
+          .panel:hover{ border-color:#2c3b46; }
           .panel .lbl{ font-family:var(--mono); font-size:10.5px; letter-spacing:.18em; text-transform:uppercase; color:var(--mut); }
           .stack{ display:flex; flex-direction:column; gap:16px; }
           .hero .pct{ font-family:var(--disp); font-weight:700; font-size:clamp(58px,11vw,104px); line-height:.92; letter-spacing:-3px; font-variant-numeric:tabular-nums; margin:6px 0 2px; }
@@ -356,14 +360,17 @@ jobs:
           .crow{display:grid;grid-template-columns:46px 1fr 58px;gap:10px;align-items:center;margin:7px 0}
           .crow .ck{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--mut)}
           .crow code{font-family:var(--mono);font-size:12px;background:#070b0e;border:1px solid var(--line);border-radius:8px;padding:7px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
-          .cp{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;background:#16202a;color:var(--teal);border:1px solid var(--teal-d);border-radius:8px;padding:7px 4px;cursor:pointer}
+          .cp{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;background:#16202a;color:var(--teal);border:1px solid var(--teal-d);border-radius:8px;padding:7px 4px;cursor:pointer; transition:background .15s ease;}
           .cp:hover{background:var(--teal-d)}
           .cp.done{color:var(--green);border-color:#1f6f43}
-          .localurl{ margin-top:12px; padding:10px; border-radius:10px; background:#0b1418; border:1px dashed #2c4a52; font-family:var(--mono); font-size:11.5px; color:#9fe7d6; }
-          .localurl b{ color:var(--teal); }
-          .localurl a{ color:var(--teal); }
+          .localurl{ margin-top:12px; padding:11px; border-radius:10px; background:#0c0b18; border:1px dashed #3a3568; font-family:var(--mono); font-size:11.5px; color:#cfc7ff; }
+          .localurl .hd{ color:var(--violet); font-weight:700; letter-spacing:.04em; }
+          .localurl a{ color:#bdb2ff; word-break:break-all; }
+          .localurl .row{ display:flex; gap:8px; align-items:center; margin-top:7px; }
+          .localurl .row code{ flex:1; background:#070b0e; border:1px solid #2a2750; border-radius:8px; padding:7px 9px; color:#e9eef3; word-break:break-all; font-size:11px; }
+          .localurl .note{ margin-top:8px; color:var(--mut); font-size:10.5px; line-height:1.5; }
           #diagBox{ display:none; margin-top:12px; }
-          #diagBox pre{ font-family:var(--mono); font-size:11px; line-height:1.6; background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:340px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#cfe9e4; }
+          #diagBox pre{ font-family:var(--mono); font-size:11px; line-height:1.6; background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:360px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#cfe9e4; }
           .ok{ color:var(--green); } .bad{ color:var(--red); }
           @media (max-width:860px){ .grid,.lower{ grid-template-columns:1fr } }
           ::-webkit-scrollbar{width:9px;height:9px} ::-webkit-scrollbar-thumb{background:#26343d;border-radius:9px}
@@ -373,7 +380,12 @@ jobs:
           <div class="wrap">
             <header>
               <div class="brand"><h1>RDP · Mission Control</h1><span class="tag">live mirror telemetry</span></div>
-              <div class="hstat"><span id="clock">--:--:--</span><button class="diagbtn" id="diagBtn" type="button">🔍 DIAGNOSE</button><span id="alive" class="pill"><span class="d"></span><span id="alivetxt">checking</span></span></div>
+              <div class="hstat">
+                <span id="mode" class="mode">…</span>
+                <span id="clock">--:--:--</span>
+                <button class="diagbtn" id="diagBtn" type="button">🔍 DIAGNOSE</button>
+                <span id="alive" class="pill"><span class="d"></span><span id="alivetxt">checking</span></span>
+              </div>
             </header>
             <div class="grid">
               <div class="stack">
@@ -401,9 +413,9 @@ jobs:
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
                   <div class="localurl" id="localUrlBox">
-                    <div>🖥️ <b>From YOUR local pc</b> (Tailscale ON, same tailnet):</div>
-                    <div><a id="localUrl" href="#">-</a></div>
-                    <div style="margin-top:6px;color:var(--mut)">⚠️ On your pc, <b>127.0.0.1 = your own pc</b> (not the runner) - that is why it failed. Use the Tailscale URL above instead.</div>
+                    <div class="hd">🔗 OPEN ON YOUR LOCAL PC</div>
+                    <div class="row"><code id="funnelCode">-</code><button class="cp" id="funnelCopy" type="button">copy</button></div>
+                    <div class="note">This <b>Funnel</b> link (token‑gated) is the ONLY way a local‑pc browser can reach the runner — GitHub blocks direct Tailscale‑IP access to custom ports. Copy it from here (inside RDP) and paste it on your pc. If it shows “(funnel not enabled)”, read the Mission Control console for the reason.</div>
                   </div>
                   <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
                 </div>
@@ -451,43 +463,35 @@ jobs:
             setInterval(clk,1000); clk();
             var logEl=document.getElementById('log');
             function fallbackCopy(t){ var ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} document.body.removeChild(ta); }
+            function copyBtn(btn,val){ function ok(){ btn.textContent='copied'; btn.classList.add('done'); setTimeout(function(){btn.textContent='copy';btn.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }
             function setCreds(c){ if(!c)return; var map={ip:c.ip,user:c.user,pass:c.pass}; ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(!row)return; row.dataset.val=map[k]||''; var code=row.querySelector('code'); if(code)code.textContent=map[k]||'-'; }); }
-            function setLocalUrl(u){ if(!u)return; var a=document.getElementById('localUrl'); a.href=u; a.textContent=u; }
-            document.querySelectorAll('.cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); var val=row?row.dataset.val:''; if(!val)return; function ok(){ b.textContent='copied'; b.classList.add('done'); setTimeout(function(){b.textContent='copy';b.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }); });
+            document.querySelectorAll('.crow .cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); copyBtn(b, row?row.dataset.val:''); }); });
+            document.getElementById('funnelCopy').addEventListener('click',function(){ var c=document.getElementById('funnelCode'); copyBtn(this, c?c.textContent:''); });
+            function setMode(loop){ var m=document.getElementById('mode'); if(loop){ m.className='mode loop'; m.textContent='◉ RDP / loopback'; } else { m.className='mode funnel'; m.textContent='⬈ FUNNEL (local pc)'; } }
+            function setFunnel(u){ var c=document.getElementById('funnelCode'); c.textContent = u || '(funnel not enabled - see console)'; }
             function yn(v){ return v? '<span class="ok">PASS</span>' : '<span class="bad">FAIL</span>'; }
             document.getElementById('diagBtn').addEventListener('click',function(){
               var box=document.getElementById('diagBox'); var out=document.getElementById('diagOut');
               box.style.display='block'; out.innerHTML='running diagnostics…';
               fetch('/diag',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-                var host=location.hostname;
-                var lines=[];
-                lines.push('== SERVER-SIDE SELF TEST (from /diag) ==');
-                lines.push('bind address            : '+d.bindAddress+'   '+yn(d.bindOk));
-                lines.push('port '+ '7331' +' listening       : '+yn(d.portListening));
-                lines.push('firewall rule present   : '+yn(d.firewallRulePresent)+'   (ghrdp-dash, Tailscale subnet)');
-                lines.push('tailscale ip            : '+(d.tailscaleIp||'(none)'));
-                lines.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+(d.selfConnectError?('   err: '+d.selfConnectError):''));
-                lines.push('progress file readable  : '+yn(d.progressFileReadable));
-                lines.push('');
-                lines.push('== CLIENT-SIDE (your browser) ==');
-                lines.push('you opened this page at : '+host);
-                if(host==='127.0.0.1' || host==='localhost'){
-                  lines.push('<span class="bad">NOTE</span>: 127.0.0.1/localhost = THIS machine only.');
-                  lines.push('  -> if you are on your LOCAL pc, 127.0.0.1 is YOUR pc, not the runner.');
-                  lines.push('  -> open instead: '+ (d.dashboardFromLocalPc||('http://'+(d.tailscaleIp||'<tailscale-ip>')+':7331/')));
-                } else {
-                  lines.push('<span class="ok">OK</span>: you are reaching the runner by a real address ('+host+').');
-                }
-                lines.push('');
-                lines.push('== CHECKLIST (local pc cannot connect?) ==');
-                lines.push('1. Tailscale is ON on your LOCAL pc and signed into the SAME tailnet.');
-                lines.push('2. You use http://'+(d.tailscaleIp||'<tailscale-ip>')+':7331/  (NOT 127.0.0.1).');
-                lines.push('3. firewall rule present above = PASS (else the VM blocks the Tailscale subnet).');
-                lines.push('4. self-connect via TS ip above = PASS (else bind is not 0.0.0.0).');
-                lines.push('');
-                lines.push('raw: '+JSON.stringify(d,null,1));
-                out.innerHTML=lines.join('\n');
-              }).catch(function(e){ out.innerHTML='<span class="bad">/diag request failed: '+e+'</span>'; });
+                var L=[];
+                L.push('== SERVER SELF TEST (/diag) ==');
+                L.push('bind 0.0.0.0            : '+yn(d.bindOk));
+                L.push('port 7331 listening     : '+yn(d.portListening));
+                L.push('firewall rule present   : '+yn(d.firewallRulePresent));
+                L.push('tailscale ip (from cfg) : '+(d.tailscaleIp||'(none)'));
+                L.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+(d.selfConnectError?('  '+d.selfConnectError):'  (often FAIL = GitHub blocks it -> use Funnel)'));
+                L.push('funnel url              : '+(d.funnelUrl||'(not enabled)'));
+                L.push('this request via loopbk : '+yn(d.requestCameViaLoopback)+'   host='+d.requestHost);
+                L.push('');
+                L.push('== VERDICT ==');
+                L.push('Direct http://<tailscale-ip>:7331 from a local pc = blocked by GitHub (expected).');
+                L.push('Local pc MUST use the FUNNEL url (token-gated) shown in the panel above.');
+                L.push('Inside RDP, 127.0.0.1:7331 works (loopback).');
+                L.push('');
+                L.push('raw: '+JSON.stringify(d,null,1));
+                out.innerHTML=L.join('\n');
+              }).catch(function(e){ out.innerHTML='<span class="bad">/diag failed: '+e+'</span>'; });
             });
             function render(s){
               if(!s){ return; }
@@ -499,8 +503,7 @@ jobs:
               if(s.ghrdp){ document.getElementById('rdp').href=s.ghrdp; }
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
-              setCreds(s.creds);
-              if(s.localPcUrl){ setLocalUrl(s.localPcUrl); }
+              setCreds(s.creds); setFunnel(s.funnelUrl); setMode(!!s.viaLoopback);
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
               document.getElementById('bTotal').textContent=fb(a.bytesTotal); document.getElementById('speed').textContent=fs(a.speedBps);
               document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
@@ -575,7 +578,7 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      - name: Write Mission Control launcher (OBSERVABLE + self-test against Tailscale IP)
+      - name: Write Mission Control launcher (starts server + enables FUNNEL + prints local-pc link)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
@@ -588,19 +591,20 @@ jobs:
           $progressPath = Join-Path $sd 'ghrdp_progress.json'
           $emFlag = Join-Path $sd 'ghrdp_emergency.flag'
           $flushFlag = Join-Path $sd 'ghrdp_flush.flag'
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $cfg = $null; try { $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json } catch { Write-Host "[FATAL] cannot read config: $_"; Read-Host "press Enter to close"; exit 1 }
           function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), $m) -ForegroundColor $c }
-          $tsip=''; try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {}
+          function SaveCfg($c){ $c | ConvertTo-Json -Depth 6 | Set-Content $CfgPath -Encoding UTF8 }
+          $tsip=$cfg.rdpIp; if(-not $tsip){ try { $tsip=(& $ts ip -4 2>$null).Trim() } catch {} }
           Write-Host ""
           Line Cyan "============================================================"
-          Line Cyan "  MISSION CONTROL  -  RDP dashboard + mirror launcher"
+          Line Cyan "  MISSION CONTROL  -  dashboard + mirror + FUNNEL"
           Line Cyan "  This console IS your live diagnostic. Keep it open."
           Line Cyan "============================================================"
           Line White ("  RDP / Tailscale IP = {0}" -f $tsip)
           Line White ("  USER               = {0}" -f $cfg.rdpUser)
           Line White ("  MIRROR             = {0}" -f $cfg.mirror)
-          Line Green ("  FROM YOUR LOCAL PC -> http://{0}:{1}/" -f $tsip,$Port)
-          Line White ("  FROM INSIDE RDP    -> http://127.0.0.1:{0}/  or  http://{1}:{0}/" -f $Port,$tsip)
+          Line White ("  INSIDE RDP         -> http://127.0.0.1:{0}/" -f $Port)
           Write-Host ""
           if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing: $serverScript"; Read-Host "press Enter to close"; exit 1 }
           Remove-Item $okFile -Force -EA 0
@@ -608,8 +612,8 @@ jobs:
           if($cfg.mirror -and (Test-Path $watcherScript)){
             try { $wjob = Start-Job -FilePath $watcherScript -ArgumentList $CfgPath; Line Green ("[watcher] started job id={0}" -f $wjob.Id) }
             catch { Line Red ("[watcher] Start-Job FAILED: {0}" -f $_) }
-          } elseif($cfg.mirror){ Line Red "[watcher] watcher script missing: $watcherScript" }
-          else { Line Yellow "[watcher] mirror OFF - no watcher needed" }
+          } elseif($cfg.mirror){ Line Red "[watcher] watcher script missing" }
+          else { Line Yellow "[watcher] mirror OFF" }
           $sjob=$null
           try {
             $sjob = Start-Job -ScriptBlock {
@@ -623,22 +627,34 @@ jobs:
           $up=$false
           for($i=0;$i -lt 30;$i++){
             if(Test-Path $okFile){ $txt=(Get-Content $okFile -Raw).Trim(); if($txt -match 'LISTENING'){ $up=$true; Line Green ("[server] {0}" -f $txt); break } else { Line Red ("[server] {0}" -f $txt); break } }
-            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] job died early: {0}" -f (Receive-Job $sjob -EA 0)); break }
+            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] job died: {0}" -f (Receive-Job $sjob -EA 0)); break }
             Start-Sleep -Milliseconds 500
           }
-          if(-not $up){ Line Red "[server] did NOT start - browser will show CONNECTION REFUSED. See messages above." }
-          # DEEP SELF-TEST: can the VM reach itself via the Tailscale ip on this port?
-          if($up -and $tsip){
-            $selfOk=$false; $selfErr=''
-            try { Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 4 | Out-Null; $selfOk=$true } catch { $selfErr="$_" }
-            if($selfOk){ Line Green ("[selftest] PASS - http://{0}:{1}/ reachable -> your LOCAL pc (same tailnet) should load it too." -f $tsip,$Port) }
-            else { Line Red ("[selftest] FAIL - VM cannot reach itself via Tailscale ip {0}:{1} -> {2}" -f $tsip,$Port,$selfErr); Line Red "[selftest] likely cause: bind not 0.0.0.0 OR firewall 'ghrdp-dash' missing for 100.64.0.0/10." }
-          } elseif($up){ Line Yellow "[selftest] skipped - no Tailscale ip found" }
+          if(-not $up){ Line Red "[server] did NOT start - see above." }
+          # ---- enable Tailscale FUNNEL (the only local-pc-reachable path) ----
+          $funnelUrl=''
+          if($up){
+            try {
+              & $ts funnel --bg $Port on 2>&1 | ForEach-Object { Line DarkGray ("[funnel] {0}" -f $_) }
+              $LASTEXITCODE=0
+              Start-Sleep -Seconds 3
+              $stj = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop
+              $dns = $stj.Self.DNSName
+              if($dns){ $dns=$dns.TrimEnd('.'); $funnelUrl = ("https://{0}/?key={1}" -f $dns,$cfg.dashToken); Line Green ("[funnel] ENABLED -> {0}" -f $funnelUrl) }
+              else { Line Yellow "[funnel] enabled but DNS name not found in status" }
+            } catch { Line Red ("[funnel] enable FAILED: {0}  (tailnet may block Funnel; use RDP-internal dashboard + rentry tracker)" -f $_) }
+            $cfg.funnelUrl = $funnelUrl; SaveCfg $cfg
+          }
           $loopOk=$false; try { Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/" -f $Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $loopOk=$true } catch {}
           Line $(if($loopOk){'Green'}else{'Red'}) ("[selftest] loopback 127.0.0.1:{0} = {1}" -f $Port,$loopOk)
-          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" } catch { Line Red ("[browser] open failed: {0}" -f $_) } }
-          Line Cyan "------------------------------------------------------------"
-          Line Cyan "  LIVE STATUS (window open = server alive; close = stop)"
+          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" } catch {} }
+          Write-Host ""
+          Line Cyan "============================================================"
+          Line Cyan "  >>> COPY THIS ONTO YOUR LOCAL PC BROWSER <<<"
+          if($funnelUrl){ Line Green ("  {0}" -f $funnelUrl) } else { Line Red "  (Funnel unavailable - open http://127.0.0.1:7331/ inside RDP instead)" }
+          Line Cyan "============================================================"
+          Write-Host ""
+          Line Cyan "  LIVE STATUS (window open = alive; close = stop)"
           Line Cyan "------------------------------------------------------------"
           while($true){
             $sAlive = ($sjob -and $sjob.State -eq 'Running')
@@ -647,9 +663,9 @@ jobs:
             $done=0;$act=0;$fail=0;$trk=0;$pct=0
             if(Test-Path $progressPath){ try { $p=Get-Content $progressPath -Raw|ConvertFrom-Json -EA 0; if($p -and $p.agg){ $done=$p.agg.done;$act=$p.agg.active;$fail=$p.agg.failed;$trk=$p.agg.tracked;$pct=$p.agg.overallPct } } catch {} }
             $col = if($listen){ 'Green' } else { 'Red' }
-            Line $col ("server={0} listen={1} watcher={2} | done={3} active={4} fail={5} tracked={6} overall={7}%" -f $sAlive,$listen,$wAlive,$done,$act,$fail,$trk,$pct)
-            if($sjob -and $sjob.State -ne 'Running'){ $msg=Receive-Job $sjob -EA 0; Line Red ("[server] JOB NOT RUNNING (state={0}): {1}" -f $sjob.State,$msg) }
-            if($wjob -and $wjob.State -ne 'Running'){ $msg=Receive-Job $wjob -EA 0; Line Red ("[watcher] JOB NOT RUNNING (state={0}): {1}" -f $wjob.State,$msg) }
+            Line $col ("server={0} listen={1} watcher={2} funnel={3} | done={4} active={5} fail={6} tracked={7} overall={8}%" -f $sAlive,$listen,$wAlive,[bool]$funnelUrl,$done,$act,$fail,$trk,$pct)
+            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] NOT RUNNING: {0}" -f (Receive-Job $sjob -EA 0)) }
+            if($wjob -and $wjob.State -ne 'Running'){ Line Red ("[watcher] NOT RUNNING: {0}" -f (Receive-Job $wjob -EA 0)) }
             Start-Sleep -Seconds 2
           }
           EOF
@@ -666,16 +682,14 @@ jobs:
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  DASHBOARD FROM YOUR LOCAL PC (Tailscale ON, same tailnet):"
-          Write-Host "        http://${ip}:7331/"
-          Write-Host "  (127.0.0.1 works ONLY inside the RDP desktop.)"
-          Write-Host "  Inside RDP: double-click desktop icon 'Mission Control'."
-          Write-Host "  Stuck? click the DIAGNOSE button on the dashboard."
+          Write-Host "  LOCAL PC DASHBOARD = FUNNEL link in the Mission Control"
+          Write-Host "  console inside RDP (https://<runner>.<tail>.ts.net/?key=..)"
+          Write-Host "  INSIDE RDP: double-click desktop icon 'Mission Control'."
+          Write-Host "  (direct http://$ip`:7331 from local pc is blocked by GitHub)"
           Write-Host "============================================================"
           "### RDP Credentials" >> $S
           "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
-          "**Dashboard FROM YOUR LOCAL PC** (Tailscale ON, same tailnet): **http://${ip}:7331/**  (do NOT use 127.0.0.1 on your pc - that is your own pc).  |  Inside RDP: double-click the desktop icon 'Mission Control'.  |  Stuck? click **DIAGNOSE** on the dashboard." >> $S
-          "_GitHub keeps the Summary tab blank while the job runs and won't expand running steps. Read creds from the finished 'Show RDP credentials' step._" >> $S
+          "**Local‑pc dashboard = the FUNNEL link** printed by the **Mission Control** console inside RDP (copy it there; it is token‑gated). Direct ``http://$ip`:7331`` from a local pc is blocked by GitHub runner network policy. Inside RDP: double‑click **Mission Control**. Stuck? click **DIAGNOSE** on the dashboard." >> $S
           if($cfg.mirror){ "Mirror ON: in the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
           EOF
 
@@ -694,7 +708,7 @@ jobs:
           New-ItemProperty -Path $mAcc -Name 'StartColor'      -Value 0x8c2bc4 -PropertyType DWord -Force|Out-Null
           New-ItemProperty -Path $mAcc -Name 'AccentColor'     -Value 0xffc42b8c -PropertyType DWord -Force|Out-Null
           try{ $mag=[byte[]](0x8C,0x2B,0xC4,0xFF,0x9E,0x33,0xD0,0xFF,0xB0,0x3B,0xDC,0xFF,0xC2,0x43,0xE8,0xFF,0x7A,0x22,0xB0,0xFF,0x66,0x1A,0x9C,0xFF,0x52,0x12,0x88,0xFF,0x3E,0x0A,0x74,0xFF); Set-ItemProperty -Path $mAcc -Name 'AccentPalette' -Value $mag -PropertyType Binary -Force|Out-Null }catch{}
-          Write-Host "Machine-wide dark mode + magenta accent set (profile untouched)."
+          Write-Host "Machine-wide dark mode + magenta accent set."
           $edgePol='HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist'; if(-not(Test-Path $edgePol)){New-Item -Path $edgePol -Force|Out-Null}
           $crx='https://edge.microsoft.com/extensionwebstorebase/v1/crx'
           New-ItemProperty -Path $edgePol -Name '1' -Value "odfafepnkmbhccpbejgmiehpchacaeak;$crx" -PropertyType String -Force|Out-Null
@@ -716,15 +730,15 @@ jobs:
           $ps="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
           $args = "-NoExit -ExecutionPolicy Bypass -File `"$launcher`" -CfgPath `"$cfgPath`" -Port 7331"
           foreach($desk in @("C:\Users\Public\Desktop","C:\Users\$($env:RDP_USER)\Desktop")){
-            try { New-Item -ItemType Directory -Path $desk -Force -EA 0 | Out-Null; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut((Join-Path $desk 'Mission Control.lnk')); $sc.TargetPath=$ps; $sc.Arguments=$args; $sc.WindowStyle=1; $sc.Description='Start RDP dashboard + mirror (live console)'; $sc.Save(); Write-Host "Mission Control shortcut -> $desk" } catch { Write-Host "shortcut err $desk : $_" }
+            try { New-Item -ItemType Directory -Path $desk -Force -EA 0 | Out-Null; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut((Join-Path $desk 'Mission Control.lnk')); $sc.TargetPath=$ps; $sc.Arguments=$args; $sc.WindowStyle=1; $sc.Description='Start RDP dashboard + mirror + Funnel (live console)'; $sc.Save(); Write-Host "Mission Control shortcut -> $desk" } catch { Write-Host "shortcut err $desk : $_" }
           }
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
-          "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control Ready" >> $env:GITHUB_STEP_SUMMARY
-          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. **Dashboard FROM YOUR LOCAL PC: http://<tailscale-ip>:7331/** (Tailscale ON, same tailnet). Inside RDP double-click 'Mission Control'. Stuck? click **DIAGNOSE** on the dashboard (deep self-test)." >> $env:GITHUB_STEP_SUMMARY
-          Write-Host "Configure step complete (no profile touched, exit forced 0)."
+          "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control + Funnel Ready" >> $env:GITHUB_STEP_SUMMARY
+          "Dark mode + magenta accent, bookmarks, qBittorrent, Parsec installed. **Local‑pc dashboard = the FUNNEL link in the Mission Control console (token‑gated).** Inside RDP double‑click **Mission Control**; the dashboard shows a copy‑able Funnel link + a **DIAGNOSE** deep self‑test. Direct Tailscale‑IP access from a local pc is blocked by GitHub (expected)." >> $env:GITHUB_STEP_SUMMARY
+          Write-Host "Configure step complete (exit forced 0)."
           exit 0
 
-      - name: Prepare dashboard + mirror config
+      - name: Prepare dashboard + mirror config (incl. random dashboard token)
         env:
           MIRROR: ${{ github.event.inputs.mirror_downloads_public }}
         run: |
@@ -734,17 +748,18 @@ jobs:
           $indexPath=Join-Path $sd 'ghrdp_mirror_index.json'; $progressPath=Join-Path $sd 'ghrdp_progress.json'
           $hbPath=Join-Path $sd 'ghrdp_heartbeat.txt'; $emPath=Join-Path $sd 'ghrdp_emergency.flag'; $cfPath=Join-Path $sd 'ghrdp_cancel.flag'; $adPath=Join-Path $sd 'ghrdp_alldone.flag'
           $cfgPath=Join-Path $sd 'ghrdp_cfg.json'; $mirrorOn=($env:MIRROR -eq 'true')
+          $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]})
           if($mirrorOn){
-            $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(20); $rng.GetBytes($b); $decPw=-join ($b|%{$alpha[[int]$_ % $alpha.Length]})
+            $b2=[byte[]]::new(20); $rng.GetBytes($b2); $decPw=-join ($b2|%{$alpha[[int]$_ % $alpha.Length]})
             $dlDir="C:\Users\$user\Downloads"; $tempDir="C:\Users\$user\AppData\Local\Temp"
             $roots=@(@{path=$dlDir;rec=$false;min=0;tag='Downloads'},@{path=$tempDir;rec=$true;min=102400;tag='Temp'})
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
-            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
+            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; dashToken=$dashToken; funnelUrl=''; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
             $cfg | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8
           } else {
-            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
+            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; dashToken=$dashToken; funnelUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          Write-Host "Config written. mirror=$mirrorOn. Dashboard launched by Mission Control icon; reachable from local pc at http://${ip}:7331/"
+          Write-Host "Config written. mirror=$mirrorOn. dashToken set. Funnel enabled by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
       - name: Keep Alive (5h30)
@@ -752,7 +767,7 @@ jobs:
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          Write-Host "Session alive 5h30. Local pc dashboard: http://<tailscale-ip>:7331/ . Inside RDP: Mission Control icon."
+          Write-Host "Session alive 5h30. Local pc = Funnel link from Mission Control console. Inside RDP = Mission Control icon."
           while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
           Write-Host "5h30 done."
 
@@ -824,8 +839,9 @@ jobs:
           Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths' -ErrorAction SilentlyContinue
           Set-Clipboard -Value "" -ErrorAction SilentlyContinue; Clear-RecycleBin -Force -ErrorAction SilentlyContinue
           wevtutil el 2>$null | %{wevtutil cl "$_" 2>$null}; $LASTEXITCODE = 0
+          & "C:\Program Files\Tailscale\tailscale.exe" funnel --bg 7331 off 2>$null | Out-Null; $LASTEXITCODE=0
           "### Secure Cleanup Complete" >> $env:GITHUB_STEP_SUMMARY
-          "VM wiped (incl D-RDP-Storage). Mirror copies (AES) + rentry index remain if mirror ON. No GitHub secrets - recoverable from script." >> $env:GITHUB_STEP_SUMMARY
+          "VM wiped (incl D-RDP-Storage). Mirror copies (AES) + rentry index remain if mirror ON. Funnel turned off. No GitHub secrets - recoverable from script." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Overwrite free space (skip on cancel)
         if: ${{ always() && !cancelled() }}
