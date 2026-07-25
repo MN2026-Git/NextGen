@@ -103,6 +103,29 @@ jobs:
           Add-Content $env:GITHUB_ENV "RDP_USER=$user"; Add-Content $env:GITHUB_ENV "RDP_PASS=$pass"
           Write-Host "Created account: $user"
 
+      # =====================================================================
+      #  FAST STEP - finishes in ~1s, so you CAN expand it while the job runs.
+      #  This is the ONLY reliable place to read IP/user/pass live, because
+      #  GitHub will NOT let you expand a step that is still running.
+      # =====================================================================
+      - name: Show RDP credentials (open THIS step for IP/user/pass)
+        run: |
+          $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
+          $user = $env:RDP_USER; $pass = $env:RDP_PASS
+          Write-Host "============================================================"
+          Write-Host "  RDP CREDENTIALS  (this step is FINISHED -> expandable now)"
+          Write-Host "  IP   = $ip"
+          Write-Host "  USER = $user"
+          Write-Host "  PASS = $pass"
+          Write-Host "------------------------------------------------------------"
+          Write-Host "  HOW TO CONNECT (your PC must have Tailscale ON):"
+          Write-Host "   1) Win+R -> mstsc -> Computer: $ip -> Connect"
+          Write-Host "   2) user $user / pass $pass"
+          Write-Host "   3) INSIDE the desktop open browser -> http://127.0.0.1:7331/"
+          Write-Host "      (that IS the live dashboard + tracker + creds panel;"
+          Write-Host "       it runs on loopback so no external link is needed)"
+          Write-Host "============================================================"
+
       - name: Write mirror lib (shared functions)
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
         shell: bash
@@ -367,7 +390,7 @@ jobs:
                   <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
-                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">Live while the run is alive (the GitHub Summary tab stays blank until the job ends - that is a GitHub limitation, not a bug). Manual: Win+R → mstsc → paste IP.</p>
+                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">Live while the run is alive. (The GitHub Summary tab stays blank until the job ends - a GitHub limitation. Open this page from inside RDP at http://127.0.0.1:7331/ or via the tailscale serve URL.)</p>
                 </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
                   <div class="stats">
@@ -512,18 +535,19 @@ jobs:
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  DASHBOARD (open from YOUR PC, Tailscale ON): $serve"
-          Write-Host "  DASHBOARD (from INSIDE the RDP desktop):     http://127.0.0.1:7331/"
+          Write-Host "  DASHBOARD (from INSIDE the RDP desktop): http://127.0.0.1:7331/"
+          if($serve){ Write-Host "  DASHBOARD (from YOUR PC, Tailscale ON):  $serve" }
           Write-Host "  Handler: $ghrdp   Manual RDP: mstsc -> $ip"
-          Write-Host "  NOTE: GitHub hides the Summary tab until the job ENDS (platform"
-          Write-Host "        behaviour). While running, use THIS log view or the dashboard"
-          Write-Host "        page (both show creds + live tracker in real time)."
+          Write-Host "  NOTE: GitHub hides the Summary tab until the job ENDS and will"
+          Write-Host "  NOT expand a step that is still running. For live creds use the"
+          Write-Host "  FAST step 'Show RDP credentials' (already finished) or the"
+          Write-Host "  dashboard page above."
           Write-Host "============================================================"
           "### RDP Credentials (live - also on the dashboard page)" >> $S
           "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
           if($serve){ "**Dashboard (from your PC, Tailscale ON):** [$serve]($serve)" >> $S }
           "**Dashboard (from inside RDP):** http://127.0.0.1:7331/  |  **Handler:** ``$ghrdp``  |  **Manual:** mstsc -> ``$ip``" >> $S
-          "_GitHub keeps the Summary tab blank while the job runs (platform limitation). Use the log view above or the dashboard page for live info._" >> $S
+          "_GitHub keeps the Summary tab blank while the job runs and won't expand running steps (platform limitation). Read creds from the finished 'Show RDP credentials' step or the dashboard page._" >> $S
           if($cfg.mirror){ "Mirror ON: on the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
           EOF
 
@@ -535,7 +559,6 @@ jobs:
           $eu=[uri]::EscapeDataString($user); $ep=[uri]::EscapeDataString($pass); $ghrdp="ghrdp://$ip/$eu/$ep"; $port=7331
           $sd=$env:RUNNER_TEMP
           New-Item -ItemType Directory -Path (Join-Path $sd 'ghrdp_tmp') -Force | Out-Null
-          # firewall rule kept only as a harmless extra (real exposure is via tailscale serve below)
           New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow -Profile Any -Enabled True -ErrorAction SilentlyContinue | Out-Null
           $indexPath=Join-Path $sd 'ghrdp_mirror_index.json'; $progressPath=Join-Path $sd 'ghrdp_progress.json'
           $hbPath=Join-Path $sd 'ghrdp_heartbeat.txt'; $emPath=Join-Path $sd 'ghrdp_emergency.flag'; $cfPath=Join-Path $sd 'ghrdp_cancel.flag'; $adPath=Join-Path $sd 'ghrdp_alldone.flag'
@@ -555,27 +578,29 @@ jobs:
           } else {
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; serveUrl=''; dashboardUrl='http://127.0.0.1:7331/'; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          # launch the local HTTP server (detached) - serves the dashboard on 0.0.0.0:7331
           if(Test-Path $sp){
             $scmd = $q+$ps+$q+' -ExecutionPolicy Bypass -WindowStyle Hidden -File '+$q+$sp+$q+' -Ip 0.0.0.0 -Port '+$port+' -UiDir '+$q+$sd+$q+' -ProgressPath '+$q+$progressPath+$q+' -CfgPath '+$q+$cfgPath+$q+' -EmergencyFlagPath '+$q+$emPath+$q
             try { $sr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$scmd }; Write-Host "server create rv=$($sr.ReturnValue) pid=$($sr.ProcessId)"; $sr.ProcessId|Out-File (Join-Path $sd 'ghrdp_server.pid') -Encoding ascii } catch { Write-Host "server cim err: $_" }
           }
           Start-Sleep -Seconds 3
-          # local self-test (loopback never blocked by firewall)
+          # local self-test (loopback, short, never hangs)
           $localOk=$false
-          for($i=0;$i -lt 15;$i++){ try { Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $localOk=$true; break } catch { Start-Sleep -Seconds 1 } }
+          for($i=0;$i -lt 8;$i++){ try { Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $localOk=$true; break } catch { Start-Sleep -Seconds 1 } }
           Write-Host "local server (127.0.0.1:7331) responding: $localOk"
-          # ---- EXPOSE via tailscale serve (same proven channel as RDP - bypasses GitHub inbound block) ----
+          # ---- EXPOSE via tailscale serve, HARDENED so it can NEVER hang this step ----
           $serveOk=$false
           try {
-            & $ts serve --bg http://127.0.0.1:7331 2>&1 | Out-Null; $LASTEXITCODE=0
-            Start-Sleep -Seconds 3
+            $serveJob = Start-Job -ScriptBlock { param($t) & $t serve --bg --yes http://127.0.0.1:7331 2>&1 | Out-String } -ArgumentList $ts
+            $done = Wait-Job $serveJob -Timeout 20
+            if($done){ Receive-Job $serveJob | ForEach-Object { Write-Host "serve: $_" }; Remove-Job $serveJob -Force }
+            else { Write-Host "serve: timed out (20s) - not fatal, use http://127.0.0.1:7331/ from inside RDP"; Stop-Job $serveJob -ErrorAction SilentlyContinue; Remove-Job $serveJob -Force -ErrorAction SilentlyContinue }
+            $LASTEXITCODE=0
+            Start-Sleep -Seconds 2
             $stj = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop
             $dns = $stj.Self.DNSName
             if ($dns) { $dns = $dns.TrimEnd('.'); $serveUrl = "https://$dns/"; $serveOk=$true }
             Write-Host "tailscale serve URL: $serveUrl"
-          } catch { Write-Host "tailscale serve err: $_" }
-          # write serveUrl back into cfg so the dashboard + /progress can show it
+          } catch { Write-Host "tailscale serve err: $_  -> use http://127.0.0.1:7331/ from inside RDP" }
           try { $c = Get-Content $cfgPath -Raw | ConvertFrom-Json; $c.serveUrl = $serveUrl; $c | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8 } catch {}
           $okFile=Join-Path $sd 'ghrdp_server_ok.txt'; $okTxt= if(Test-Path $okFile){ (Get-Content $okFile -Raw).Trim() } else { '(no ok file)' }
           Write-Host "==== DASHBOARD DIAG ===="
