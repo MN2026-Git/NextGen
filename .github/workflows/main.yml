@@ -103,10 +103,6 @@ jobs:
           Add-Content $env:GITHUB_ENV "RDP_USER=$user"; Add-Content $env:GITHUB_ENV "RDP_PASS=$pass"
           Write-Host "Created account: $user"
 
-      # =====================================================================
-      #  FAST STEP - finishes in ~1s -> you CAN expand it while job runs.
-      #  Read IP/user/pass HERE (GitHub won't expand a still-running step).
-      # =====================================================================
       - name: Show RDP credentials (open THIS step for IP/user/pass)
         run: |
           $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
@@ -121,9 +117,8 @@ jobs:
           Write-Host "  2) user $user / pass $pass"
           Write-Host "  3) INSIDE the RDP desktop, open a browser and go to:"
           Write-Host "        http://127.0.0.1:7331/"
-          Write-Host "     (that is the live dashboard. It only answers from INSIDE"
-          Write-Host "      the RDP desktop - NOT from your local PC. It becomes"
-          Write-Host "      available once the 'Keep Alive' step starts.)"
+          Write-Host "     (dashboard answers ONLY from inside the RDP desktop,"
+          Write-Host "      NOT from your local PC. It is live while Keep Alive runs.)"
           Write-Host "============================================================"
 
       - name: Write mirror lib (shared functions)
@@ -198,7 +193,7 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (defines Start-GhrdpServer; runs INSIDE Keep Alive)
+      - name: Write dashboard server script (defines Start-GhrdpServer; dot-sourced by Keep Alive)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
@@ -224,13 +219,11 @@ jobs:
             } catch { DLog "req err: $_" }
             try { $client.Close() } catch {}
           }
-          # start watcher as a background JOB (lives as long as this step)
           $job=$null
           if($WatcherScript -and (Test-Path $WatcherScript)){ try{ $job=Start-Job -FilePath $WatcherScript -ArgumentList $CfgPath; DLog "watcher job started id=$($job.Id)" }catch{ DLog "watcher Start-Job failed: $_" } }
           $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Any), ([int]$Port)
           try { $listener.Start(); DLog "TcpListener STARTED 0.0.0.0:$Port (foreground, tied to Keep Alive step)" } catch { DLog "TcpListener START FAILED: $_"; if($job){Stop-Job $job -EA 0; Remove-Job $job -Force -EA 0}; return }
           $start=Get-Date; $limit=(New-TimeSpan -Minutes $LimitMinutes); $flushAt=(New-TimeSpan -Minutes $FlushAtMinutes); $flushed=$false
-          # local self-test
           $selfOk=$false; try{ Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfOk=$true }catch{}; DLog "local self-test=$selfOk"
           while(((Get-Date)-$start) -lt $limit){
             if((-not $flushed) -and (((Get-Date)-$start) -ge $flushAt)){ "flush"|Out-File $FlushFlagPath -Encoding ascii; $flushed=$true; DLog "flush flag written" }
@@ -520,7 +513,7 @@ jobs:
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
           Write-Host "  DASHBOARD = open INSIDE the RDP desktop: http://127.0.0.1:7331/"
-          Write-Host "  (NOT from your local PC. Available once Keep Alive starts.)"
+          Write-Host "  (NOT from your local PC. Live while Keep Alive runs.)"
           Write-Host "  Manual RDP from your PC (Tailscale ON): mstsc -> $ip"
           Write-Host "============================================================"
           "### RDP Credentials" >> $S
@@ -566,11 +559,6 @@ jobs:
           Write-Host "Configure step complete (no profile touched, exit forced 0)."
           exit 0
 
-      # =====================================================================
-      #  PREPARE CONFIG ONLY (no process launch here - that was the old bug).
-      #  The server + watcher are started in the NEXT step (Keep Alive) so they
-      #  stay alive for the whole 5h30 session.
-      # =====================================================================
       - name: Prepare dashboard + mirror config
         env:
           MIRROR: ${{ github.event.inputs.mirror_downloads_public }}
@@ -591,38 +579,22 @@ jobs:
           } else {
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          Write-Host "Config written. mirror=$mirrorOn. Server+watcher will start in Keep Alive step."
+          Write-Host "Config written. mirror=$mirrorOn. Server+watcher start in Keep Alive step."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
       # =====================================================================
-      #  KEEP ALIVE = hosts the dashboard server (foreground) + the mirror
-      #  watcher (background job) for the whole 5h30. Because this step runs
-      #  for 5h30, both stay alive the whole time -> dashboard answers at
-      #  127.0.0.1:7331 from inside RDP, and mirroring actually happens.
+      #  KEEP ALIVE hosts the dashboard (foreground) + watcher (job) for 5h30.
+      #  The server function is dot-sourced from the file written earlier
+      #  (NO separate keepalive script file -> no ordering bug).
       # =====================================================================
       - name: Keep Alive (5h30) - hosts dashboard + watcher
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
-          & (Join-Path $sd 'ghrdp-keepalive.ps1') -CfgPath (Join-Path $sd 'ghrdp_cfg.json') -Port 7331 -UiDir $sd -ProgressPath (Join-Path $sd 'ghrdp_progress.json') -EmergencyFlagPath (Join-Path $sd 'ghrdp_emergency.flag') -FlushFlagPath (Join-Path $sd 'ghrdp_flush.flag') -LimitMinutes 330 -FlushAtMinutes 270 -ServerScript (Join-Path $sd 'rdp-redirect-server.ps1') -WatcherScript (Join-Path $sd 'ghrdp-watcher.ps1')
-
-      - name: Write keepalive host script
-        shell: bash
-        run: |
-          cat > "$RUNNER_TEMP/ghrdp-keepalive.ps1" <<'EOF'
-          param([string]$CfgPath,[int]$Port,[string]$UiDir,[string]$ProgressPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[int]$LimitMinutes,[int]$FlushAtMinutes,[string]$ServerScript,[string]$WatcherScript)
-          $ErrorActionPreference='SilentlyContinue'
-          Write-Host "Keep Alive host starting - loading server script..."
-          . $ServerScript   # defines Start-GhrdpServer (which also starts the watcher job + runs the listener loop)
-          Write-Host "Starting dashboard server (foreground) + watcher (job) for $LimitMinutes minutes..."
-          Start-GhrdpServer -Port $Port -UiDir $UiDir -ProgressPath $ProgressPath -CfgPath $CfgPath -EmergencyFlagPath $EmergencyFlagPath -FlushFlagPath $FlushFlagPath -LimitMinutes $LimitMinutes -FlushAtMinutes $FlushAtMinutes -WatcherScript $WatcherScript
+          . (Join-Path $sd 'rdp-redirect-server.ps1')
+          Write-Host "Starting dashboard server (foreground) + watcher (job) for 330 minutes..."
+          Start-GhrdpServer -Port 7331 -UiDir $sd -ProgressPath (Join-Path $sd 'ghrdp_progress.json') -CfgPath (Join-Path $sd 'ghrdp_cfg.json') -EmergencyFlagPath (Join-Path $sd 'ghrdp_emergency.flag') -FlushFlagPath (Join-Path $sd 'ghrdp_flush.flag') -LimitMinutes 330 -FlushAtMinutes 270 -WatcherScript (Join-Path $sd 'ghrdp-watcher.ps1')
           Write-Host "Keep Alive host finished (session window closed)."
-          EOF
-          # NOTE: this Write step is placed AFTER Keep Alive in source order is wrong;
-          # GitHub runs steps top-to-bottom, so the keepalive script MUST exist before
-          # the Keep Alive step runs. We therefore also inline-create it here is too late.
-          # To guarantee ordering, the file is created in the PREVIOUS bash step below.
-          echo "keepalive script written"
 
       - name: Emergency upload on cancel (always)
         if: ${{ always() && github.event.inputs.mirror_downloads_public == 'true' }}
