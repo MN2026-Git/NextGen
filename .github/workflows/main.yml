@@ -74,6 +74,46 @@ jobs:
           if (-not $authed) { throw "Sign-in timeout." }
           Write-Host "Tailscale connected. IP = $((& $ts ip -4).Trim())"
 
+      # === EDIT A (NEW): auto-enable Funnel via Tailscale API = fully automated, no manual ACL page ===
+      - name: Auto-enable Funnel on tailnet (Tailscale API, one-time secret)
+        env:
+          TS_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          $tok = $env:TS_KEY
+          if(-not $tok){ Write-Host "[acl] TS_API_KEY secret not set -> skipping auto-ACL. (Add the secret once to fully automate; until then Funnel must be enabled manually or use the ghrdp paste fallback.)"; exit 0 }
+          $base = 'https://api.tailscale.com/api/v2/tailnet/-/acl'
+          $authH = @{ Authorization = ("Bearer " + $tok) }
+          # --- read current ACL as text (HuJSON) ---
+          $txt = $null
+          try { $r = Invoke-WebRequest -Uri $base -Headers $authH -UseBasicParsing -TimeoutSec 30; $txt = $r.Content } catch { Write-Host "[acl] GET failed: $($_.Exception.Message)" }
+          $acl = $null
+          if($txt){
+            $clean = $txt -replace '/\*[\s\S]*?\*/',''           # strip block comments
+            $clean = ($clean -split "`n" | ForEach-Object { $_ -replace '//[^\r\n]*','' }) -join "`n"  # strip line comments
+            $clean = $clean -replace ',(\s*[\]}])','$1'          # strip trailing commas
+            try { $acl = $clean | ConvertFrom-Json -ErrorAction Stop } catch { Write-Host "[acl] could not parse ACL text - will NOT clobber your rules."; $acl=$null }
+          }
+          $needPost = $false
+          if($acl){
+            $na = @()
+            if($acl.PSObject.Properties['nodeAttrs'] -and $acl.nodeAttrs){ $na = @($acl.nodeAttrs) }
+            $has = $false
+            foreach($n in $na){ $tg=@($n.target); $at=@($n.attr); if(($tg -contains '*') -and ($at -contains 'funnel')){ $has=$true } }
+            if(-not $has){
+              $na = $na + ,@{ target=@('*'); attr=@('funnel') }
+              if($acl.PSObject.Properties['nodeAttrs']){ $acl.nodeAttrs = $na } else { $acl | Add-Member -NotePropertyName 'nodeAttrs' -NotePropertyValue $na -Force }
+              $needPost = $true
+            } else { Write-Host "[acl] funnel attr already present - nothing to do." }
+          }
+          if($needPost){
+            $body = [System.Text.Encoding]::UTF8.GetBytes(($acl | ConvertTo-Json -Depth 12 -Compress))
+            try {
+              Invoke-WebRequest -Uri $base -Headers (@{ Authorization=("Bearer "+$tok); 'Content-Type'='application/json' }) -Method Post -Body $body -UseBasicParsing -TimeoutSec 30 | Out-Null
+              Write-Host "[acl] SUCCESS - Funnel attr added via API (your existing acls/ssh rules were kept)."
+            } catch { Write-Host "[acl] merged POST failed: $($_.Exception.Message) - NOT clobbering your ACL. Add nodeAttrs manually if needed." }
+          }
+          if(-not $acl){ Write-Host "[acl] left ACL unchanged (could not safely read it). If Funnel still fails after this, the token may lack write permission - regenerate with admin rights." }
+
       - name: Enable RDP + harden + open dashboard port (all profiles)
         run: |
           $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
@@ -678,7 +718,7 @@ jobs:
           }
           EOF
 
-      # === EDIT 2: summary - clickable Funnel hyperlink when ACL done; exact ACL box + ghrdp fallback when not ===
+      # === EDIT C: summary - clickable Funnel HYPERLINK when auto-ACL worked; honest fallback when not ===
       - name: Write summary helper (highlighted ONE-CLICK link in Summary)
         shell: bash
         run: |
@@ -691,45 +731,35 @@ jobs:
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host '============================================================'
           Write-Host ('  RDP READY  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
-          if($funnel){ Write-Host ('  PRIMARY clickable (local pc): ' + $funnel) }
-          else       { Write-Host '  PRIMARY clickable: MISSING -> do ACTION 1 (Tailscale ACL) then re-run.' }
-          Write-Host ('  ZERO-TYPING (paste in browser bar, no hyperlink possible): ' + $ghrdp)
+          if($funnel){ Write-Host ('  CLICKABLE HYPERLINK (local pc): ' + $funnel) }
+          else       { Write-Host '  CLICKABLE HYPERLINK: missing -> add secret TS_API_KEY (EDIT A) then re-run, OR enable Funnel in ACL once.' }
+          Write-Host ('  FALLBACK (paste in browser bar): ' + $ghrdp)
           Write-Host '============================================================'
           '### RDP is ready' >> $S
           '' >> $S
           if($funnel){
-            '#### 1) CLICK on your local pc (hyperlink - loads the web dashboard, auto-connects RDP, zero typing):' >> $S
+            '#### 1) CLICK this hyperlink on your LOCAL pc (opens the web-app, auto-connects RDP, zero typing):' >> $S
             '' >> $S
             ('**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](' + $funnel + ')**') >> $S
             '' >> $S
             ('Copyable: `' + $funnel + '`') >> $S
             '' >> $S
-            'First time on a new PC the page auto-shows the connector installer (Download + Run with PowerShell once); tick Always-allow on the browser prompt once. After that every click auto-connects with no typing.' >> $S
+            'This https link is the clickable hyperlink (GitHub cannot make a ghrdp:// link clickable - it strips custom schemes - so the web-app link is the https one). On a brand-new PC the web-app shows a one-time connector installer; after that every click auto-connects with no typing. Tick Always-allow on the browser prompt once.' >> $S
             '' >> $S
           } else {
-            '#### ⚠️ ONE-TIME SETUP NEEDED for the clickable local-pc web-app link' >> $S
+            '#### 1) Clickable hyperlink not ready yet' >> $S
             '' >> $S
-            'The clickable hyperlink needs **Tailscale Funnel**, which is OFF on your tailnet right now (that is why no https link appears). Turn it ON **once** at **https://login.tailscale.com/admin/acls** by merging this into the ACL JSON (keep your existing `acls`/`ssh` blocks, just add `nodeAttrs`), then **re-run** this workflow:' >> $S
-            '' >> $S
-            '```json' >> $S
-            '{' >> $S
-            '  "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ],' >> $S
-            '  "nodeAttrs": [ { "target": ["*"], "attr": ["funnel"] } ],' >> $S
-            '  "ssh": [ { "action": "check", "src": ["autogroup:members"], "dst": ["autogroup:self"], "users": ["autogroup:nonroot", "root"] } ]' >> $S
-            '}' >> $S
-            '```' >> $S
+            'To get the clickable https web-app link **fully automatically**, add the GitHub secret **TS_API_KEY** once (a Tailscale access token from https://login.tailscale.com/admin/settings/keys) and re-run - the workflow then enables Funnel itself (EDIT A). Or enable Funnel once manually at https://login.tailscale.com/admin/acls by adding `"nodeAttrs":[{"target":["*"],"attr":["funnel"]}]`.' >> $S
             '' >> $S
             if($ferr){ ('Last Funnel error from the runner: `' + $ferr + '`') >> $S; '' >> $S }
-            'After re-run, a **clickable** `https://....ts.net/?key=...` link appears above and opens the dashboard on your pc.' >> $S
-            '' >> $S
           }
-          '#### 2) ZERO-TYPING RDP right now (no hyperlink - GitHub blocks custom-scheme links, so PASTE this in your LOCAL browser address bar + Enter, then click Open once):' >> $S
+          '#### 2) ZERO-TYPING RDP right now (GitHub blocks custom-scheme hyperlinks, so PASTE this in your LOCAL browser address bar + Enter, then click Open once):' >> $S
           '' >> $S
           '```' >> $S
           $ghrdp >> $S
           '```' >> $S
           '' >> $S
-          'This opens RDP with the password auto-filled (no IP/user/password typing). On a brand-new PC the first paste may show nothing until the connector is installed once - in that case open the dashboard from inside RDP and use its Download-connector button, or use method 1 after ACTION 1.' >> $S
+          'This opens RDP with the password auto-filled (no IP/user/password typing). It is a paste, not a hyperlink, only because GitHub refuses to render ghrp:// as a link - the clickable hyperlink is method 1 above.' >> $S
           '' >> $S
           '#### 3) Manual mstsc (reference only)' >> $S
           '' >> $S
