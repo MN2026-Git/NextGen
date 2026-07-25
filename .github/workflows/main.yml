@@ -74,23 +74,64 @@ jobs:
           if (-not $authed) { throw "Sign-in timeout." }
           Write-Host "Tailscale connected. IP = $((& $ts ip -4).Trim())"
 
-      # === EDIT A (NEW): auto-enable Funnel via Tailscale API = fully automated, no manual ACL page ===
+      # === EDIT 1: Auto-enable Funnel - prints FULL Sinhala guide WITH clickable links IN THIS LOG when secret missing ===
       - name: Auto-enable Funnel on tailnet (Tailscale API, one-time secret)
         env:
           TS_KEY: ${{ secrets.TS_API_KEY }}
         run: |
           $tok = $env:TS_KEY
-          if(-not $tok){ Write-Host "[acl] TS_API_KEY secret not set -> auto-ACL skipped. OPEN the Summary tab: it has a step-by-step Sinhala guide WITH clickable links to add the secret once; OR use the ghrdp paste link in the Summary to connect RIGHT NOW with zero typing (no waiting)."; exit 0 }
+          $secretPage = 'https://github.com/' + $env:GITHUB_REPOSITORY + '/settings/secrets/actions/new'
+          $actionsPage = 'https://github.com/' + $env:GITHUB_REPOSITORY + '/actions'
+          $tokenPage  = 'https://login.tailscale.com/admin/settings/keys'
+          $aclPage    = 'https://login.tailscale.com/admin/acls'
+          if(-not $tok){
+            Write-Host ''
+            Write-Host '############################################################'
+            Write-Host '#  CLICKABLE HYPERLINK GUIDE  (මේ step log එක ඇතුළේම)'
+            Write-Host '#  TS_API_KEY secret එක තාම add කරලා නෑ. පහත links click'
+            Write-Host '#  කරලා එක පාරක් setup කරන්න - ඊට පස්සේ සදහටම auto.'
+            Write-Host '############################################################'
+            Write-Host ''
+            Write-Host '[පියවර 1] අලුත් code commit කරන්න: මේ file එකේ EDIT 1 + EDIT 2 changes ටික repo එකට commit/push කරන්න (දැනටමත් කරලා නම් ඊළඟ පියවරට).'
+            Write-Host ''
+            Write-Host '[පියවර 2] Tailscale API token එකක් හදාගන්න - මේ link එක click කරන්න:'
+            Write-Host ('    ' + $tokenPage)
+            Write-Host '    -> Access tokens කොටසේ "Generate access token" ඔබන්න -> නම ghrdp දෙන්න, expiry පුළුවන් තරම් වැඩියෙන් -> Generate -> tskey-api-... token එක COPY කරගන්න (ආයේ පේන්නේ නෑ).'
+            Write-Host ''
+            Write-Host '[පියවර 3] Token එක GitHub secret එකක් විදිහට දාන්න - මේ link එක click කරන්න (ඔයාගේ repo secret page එකටම යනවා):'
+            Write-Host ('    ' + $secretPage)
+            Write-Host '    -> Name = TS_API_KEY (capital අකුරින්) -> Value = copy කරපු token paste -> Add secret.'
+            Write-Host ''
+            Write-Host '[පියවර 4] Workflow එක re-run කරන්න - මේ link එක click කරන්න:'
+            Write-Host ('    ' + $actionsPage)
+            Write-Host '    -> Run workflow ඔබන්න -> Tailscale sign-in link එක click කරන්න. මේ පාර මේ step එක API එක හරහා ACL update කරලා Funnel ON කරනවා.'
+            Write-Host ''
+            Write-Host '[පියවර 5] විඳගන්න: re-run එකේ Show RDP credentials step එක expand කරාම clickable https hyperlink එක (Funnel link) පේනවා -> click -> web-app load -> zero-typing RDP.'
+            Write-Host ''
+            Write-Host '--- Secret add කරන්න බෑ නම් MANUAL විදිහටත් පුළුවන් - මේ link එක click කරන්න:'
+            Write-Host ('    ' + $aclPage)
+            Write-Host '    -> ACL JSON එකට  "nodeAttrs":[{"target":["*"],"attr":["funnel"]}]  merge කරලා Save -> re-run.'
+            Write-Host ''
+            Write-Host '############################################################'
+            Write-Host '#  දැන්ම RDP යන්න (wait කරන්න ඕනෑ නෑ) - මේ ghrdp link එක'
+            Write-Host '#  ඔයාගේ LOCAL browser address bar එකේ PASTE කරලා Enter,'
+            Write-Host '#  ඊට පස්සේ Open එක පාරක් click (password auto-fill වෙනවා):'
+            Write-Host ('#    ' + $env:GHRDP_NOW)
+            Write-Host '#  (ghrdp:// log එකේ clickable වෙන්නේ නෑ - GitHub rule එකක්;'
+            Write-Host '#   ඒක paste fallback විතරයි. clickable link = පියවර 5.)'
+            Write-Host '############################################################'
+            Write-Host ''
+            exit 0
+          }
           $base = 'https://api.tailscale.com/api/v2/tailnet/-/acl'
           $authH = @{ Authorization = ("Bearer " + $tok) }
-          # --- read current ACL as text (HuJSON) ---
           $txt = $null
           try { $r = Invoke-WebRequest -Uri $base -Headers $authH -UseBasicParsing -TimeoutSec 30; $txt = $r.Content } catch { Write-Host "[acl] GET failed: $($_.Exception.Message)" }
           $acl = $null
           if($txt){
-            $clean = $txt -replace '/\*[\s\S]*?\*/',''           # strip block comments
-            $clean = ($clean -split "`n" | ForEach-Object { $_ -replace '//[^\r\n]*','' }) -join "`n"  # strip line comments
-            $clean = $clean -replace ',(\s*[\]}])','$1'          # strip trailing commas
+            $clean = $txt -replace '/\*[\s\S]*?\*/',''
+            $clean = ($clean -split "`n" | ForEach-Object { $_ -replace '//[^\r\n]*','' }) -join "`n"
+            $clean = $clean -replace ',(\s*[\]}])','$1'
             try { $acl = $clean | ConvertFrom-Json -ErrorAction Stop } catch { Write-Host "[acl] could not parse ACL text - will NOT clobber your rules."; $acl=$null }
           }
           $needPost = $false
@@ -109,10 +150,10 @@ jobs:
             $body = [System.Text.Encoding]::UTF8.GetBytes(($acl | ConvertTo-Json -Depth 12 -Compress))
             try {
               Invoke-WebRequest -Uri $base -Headers (@{ Authorization=("Bearer "+$tok); 'Content-Type'='application/json' }) -Method Post -Body $body -UseBasicParsing -TimeoutSec 30 | Out-Null
-              Write-Host "[acl] SUCCESS - Funnel attr added via API (your existing acls/ssh rules were kept)."
-            } catch { Write-Host "[acl] merged POST failed: $($_.Exception.Message) - NOT clobbering your ACL. Add nodeAttrs manually if needed." }
+              Write-Host "[acl] SUCCESS - Funnel attr added via API (existing acls/ssh rules kept)."
+            } catch { Write-Host "[acl] merged POST failed: $($_.Exception.Message) - NOT clobbering your ACL." }
           }
-          if(-not $acl){ Write-Host "[acl] left ACL unchanged (could not safely read it). If Funnel still fails after this, the token may lack write permission - regenerate with admin rights." }
+          if(-not $acl){ Write-Host "[acl] left ACL unchanged (could not safely read it). If Funnel still fails, regenerate the token with admin rights." }
 
       - name: Enable RDP + harden + open dashboard port (all profiles)
         run: |
@@ -146,18 +187,35 @@ jobs:
           Add-Content $env:GITHUB_ENV "RDP_USER=$user"; Add-Content $env:GITHUB_ENV "RDP_PASS=$pass"
           Write-Host "Created account: $user"
 
-      - name: Show RDP credentials (open THIS step for IP/user/pass)
+      # === EDIT 2: Show RDP credentials - creds + clickable Funnel link + ghrdp paste + guide, ALL in this log ===
+      - name: Show RDP credentials (open THIS step for IP/user/pass + links)
         run: |
           $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
           $user = $env:RDP_USER; $pass = $env:RDP_PASS
-          Write-Host "============================================================"
-          Write-Host "  RDP CREDENTIALS  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  AUTO-CONNECT: click the ONE-CLICK RDP link in the Summary"
-          Write-Host "  tab (it opens the dashboard on your pc, which auto-fires"
-          Write-Host "  the ghrdp handler -> RDP connects with NO typing)."
-          Write-Host "  First time the browser asks 'Open app?' -> tick ALWAYS"
-          Write-Host "  ALLOW + Open. After that: zero typing forever."
-          Write-Host "============================================================"
+          $ghrdp = "ghrdp://" + $ip + "/" + [uri]::EscapeDataString($user) + "/" + [uri]::EscapeDataString($pass)
+          Add-Content $env:GITHUB_ENV ("GHRDP_NOW=" + $ghrdp)
+          $cfgPath = Join-Path $env:RUNNER_TEMP 'ghrdp_cfg.json'
+          $funnel = ''
+          if(Test-Path $cfgPath){ try { $c = Get-Content $cfgPath -Raw | ConvertFrom-Json -EA 0; if($c.funnelUrl){ $funnel = $c.funnelUrl } } catch {} }
+          Write-Host '============================================================'
+          Write-Host ('  RDP CREDENTIALS  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
+          Write-Host '============================================================'
+          if($funnel){
+            Write-Host ''
+            Write-Host '>>> CLICKABLE HYPERLINK (ඔයාගේ PC එකේ click -> web-app -> zero-typing RDP):'
+            Write-Host ('    ' + $funnel)
+          } else {
+            Write-Host ''
+            Write-Host '>>> CLICKABLE hyperlink තාම නෑ (TS_API_KEY secret add කරලා නැති නිසා).'
+            Write-Host '>>> සම්පූර්ණ clickable-links guide එක බලන්න: "Auto-enable Funnel on tailnet" step එක expand කරන්න.'
+          }
+          Write-Host ''
+          Write-Host '>>> දැන්ම RDP යන්න (ghrdp link එක LOCAL browser address bar එකේ PASTE + Enter + Open):'
+          Write-Host ('    ' + $ghrdp)
+          Write-Host '    (ghrdp:// log එකේ clickable වෙන්නේ නෑ - GitHub rule; ඒක paste fallback. clickable link = ඉහළ https link එක.)'
+          Write-Host ''
+          Write-Host '>>> Manual mstsc (reference):  mstsc -> ' + $ip + '   user ' + $user + '   pass ' + $pass
+          Write-Host '============================================================'
 
       - name: Write mirror lib (shared functions)
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
