@@ -179,8 +179,30 @@ jobs:
           Start-Sleep -Seconds 2
           $slog=''; if(Test-Path $serveOut){ $slog=(Get-Content $serveOut -Raw -EA 0) }
           $serr=''; if(Test-Path $serveErr){ $serr=(Get-Content $serveErr -Raw -EA 0) }
-          if($slog){ Write-Host ('[serve out] ' + (($slog -replace "`r`n",' ').Trim())) }
-          if($serr){ Write-Host ('[serve err] ' + (($serr -replace "`r`n",' ').Trim())) }
+          $alltext = (($slog + "`n" + $serr) -replace "`r`n",' ')
+          $enableLink = $null
+          if($alltext -match 'https://login\.tailscale\.com/f/serve\?[^\s]+'){ $enableLink = $Matches[0] }
+          $serveDisabled = ($alltext -match 'Serve is not enabled')
+          if($serveDisabled){
+            Write-Host '============================================================'
+            Write-Host '  [IMPORTANT] Serve is OFF on your tailnet (admin switch).'
+            Write-Host '  This CANNOT be turned on by the workflow (verified).'
+            Write-Host '  The https web-app link WILL time out until you enable it'
+            Write-Host '  ONE TIME by clicking this link (then re-run):'
+            Write-Host ''
+            if($enableLink){ Write-Host ('  >>> CLICK TO ENABLE SERVE (one-time): ' + $enableLink) }
+            else { Write-Host '  >>> Tailscale admin -> your machine -> enable HTTPS/Serve.' }
+            Write-Host ''
+            Write-Host '  After enabling + re-run: the clickable https web-app link'
+            Write-Host '  appears and opens RDP from your local pc with zero typing.'
+            Write-Host ''
+            Write-Host '  UNTIL THEN - zero-typing RDP RIGHT NOW (no admin needed):'
+            Write-Host '  use the ghrdp paste link in the "Show RDP credentials" step.'
+            Write-Host '============================================================'
+            $serveUrl = ''   # do NOT advertise a link that times out
+          } else {
+            if($slog){ Write-Host ('[serve out] ' + $alltext.Trim()) }
+          }
           Write-Host '============================================================'
           if($serveUrl){
             Write-Host '  TAILNET WEB LINK (clickable on your LOCAL pc):'
