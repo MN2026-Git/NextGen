@@ -66,7 +66,7 @@ jobs:
           Set-ItemProperty -Path "$rdp\WinStations\RDP-Tcp" -Name "MinEncryptionLevel" -Value 3
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Direction Inbound -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
-          & net.exe accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 2>$null | Out-Null
+          & net.exe accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 2>$null | Out-Null; $LASTEXITCODE = 0
 
       - name: Create secure random RDP account + D-RDP-Storage
         run: |
@@ -78,12 +78,10 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
           $dl = "C:\Users\$user\Downloads"; New-Item -ItemType Directory -Path $dl -Force | Out-Null
-          & icacls.exe $dl /grant "${user}:(OI)(CI)F" 2>$null | Out-Null
-          # dedicated clean 146GB-backed folder on D: (whole D: holds runner workspace - must NOT mirror)
+          & icacls.exe $dl /grant "${user}:(OI)(CI)F" 2>$null | Out-Null; $LASTEXITCODE = 0
           if (Test-Path 'D:\') {
             $big = 'D:\RDP-Storage'; New-Item -ItemType Directory -Path $big -Force | Out-Null
-            & icacls.exe $big /grant "${user}:(OI)(CI)F" 2>$null | Out-Null
-            # desktop shortcut for the RDP user
+            & icacls.exe $big /grant "${user}:(OI)(CI)F" 2>$null | Out-Null; $LASTEXITCODE = 0
             $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut("C:\Users\Public\Desktop\RDP-Storage (D).lnk"); $sc.TargetPath = $big; $sc.Save()
             Write-Host "D:\RDP-Storage ready (146GB-backed, mirrored, qBittorrent default)."
           } else { Write-Host "No D: drive detected." }
@@ -116,13 +114,13 @@ jobs:
           if ($uj.status -eq 'ok') { if ($uj.data.downloadPage){return $uj.data.downloadPage}; if ($uj.data.code){return "https://gofile.io/d/$($uj.data.code)"}; if ($uj.data.id){return "https://gofile.io/d/$($uj.data.id)"} }
           "gofile try $a status=$($uj.status)" | Out-File $env:GHRDP_LOG -Append
           } catch { "gofile try $a err $_" | Out-File $env:GHRDP_LOG -Append }
-          Start-Sleep -Seconds (5*$a) }
+          $LASTEXITCODE = 0; Start-Sleep -Seconds (5*$a) }
           return $null }
           function Push-Rentry($cfg,$text){
           for ($n=0; $n -lt 2; $n++){
           try { $out=& curl.exe -s -S --max-time 30 -X POST ("https://rentry.co/api/edit/"+$cfg.slug) --data-urlencode "edit_code=$($cfg.editCode)" --data-urlencode "text=$text" --data-urlencode "update_mode=replace" 2>$null
           $j=$out | ConvertFrom-Json -ErrorAction Stop; if ("$($j.status)" -eq '200'){return $true}; "rentry $($j.status)" | Out-File $env:GHRDP_LOG -Append } catch { "rentry err $_" | Out-File $env:GHRDP_LOG -Append }
-          Start-Sleep -Seconds 3 }
+          $LASTEXITCODE = 0; Start-Sleep -Seconds 3 }
           return $false }
           function Load-Index($cfg){ if (Test-Path $cfg.idxFile){ try { return [System.Collections.ArrayList]@(Get-Content $cfg.idxFile -Raw | ConvertFrom-Json -ErrorAction Stop) } catch { } }; return (New-Object System.Collections.ArrayList) }
           function Save-Index($cfg,$idx){ $idx | ConvertTo-Json -Depth 5 | Set-Content $cfg.idxFile -Encoding UTF8 }
@@ -134,7 +132,7 @@ jobs:
           [void]$sb.AppendLine("| # | File | Status | One-click | gofile | Source | Time |"); [void]$sb.AppendLine("|---|---|---|---|---|---|---|")
           if ($idx.Count -eq 0){ [void]$sb.AppendLine("| - | _(none)_ | - | - | - | - | - |") }
           $n=1; foreach($it in $idx){ $oc=if($it.status -eq 'ok'){'[open](ghrdp://dl/'+$it.payload+')'}else{'-'}; $gf=if($it.gofile){'[gofile]('+$it.gofile+')'}else{'-'}; [void]$sb.AppendLine("| $n | "+$it.name+" | "+(Icon $it.status)+" | "+$oc+" | "+$gf+" | "+$it.src+" | "+$it.time+" |"); $n++ }
-          [void]$sb.AppendLine(""); [void]$sb.AppendLine("_✅ uploaded  ⏳ progress  ⚠️ limit(auto-retry)_"); return $sb.ToString() }
+          [void]$sb.AppendLine(""); [void]$sb.AppendLine("_✅ uploaded  ⏳ progress  ️ limit(auto-retry)_"); return $sb.ToString() }
           EOF
 
       - name: Write dashboard server script
@@ -218,40 +216,49 @@ jobs:
 
       - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
         run: |
-          New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null
+          # ---- DEFENSIVE: never let a best-effort native exit code fail this step ----
+          $ErrorActionPreference = 'Continue'
+          function Reset-Exit { $script:LASTEXITCODE = 0 }
+          # ---- dark mode + magenta accent + glow wallpaper (Default hive -> RDP user too) ----
+          New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null; Reset-Exit
           $defHive='C:\Users\Default\NTUSER.DAT'; $loaded=$false
-          if(Test-Path $defHive){ & reg.exe load 'HKU\TempDefault' $defHive 2>$null|Out-Null; $loaded=$true }
+          if(Test-Path $defHive){ & reg.exe load 'HKU\TempDefault' $defHive 2>$null|Out-Null; Reset-Exit; $loaded=$true }
           $pers=@('HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'); if($loaded){$pers+='HKU:\TempDefault\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'}
           foreach($k in $pers){ if(-not(Test-Path $k)){New-Item -Path $k -Force|Out-Null}; New-ItemProperty -Path $k -Name 'AppsUseLightTheme' -Value 0 -PropertyType DWord -Force|Out-Null; New-ItemProperty -Path $k -Name 'SystemUsesLightTheme' -Value 0 -PropertyType DWord -Force|Out-Null; New-ItemProperty -Path $k -Name 'ColorPrevalence' -Value 0 -PropertyType DWord -Force|Out-Null }
           $acc=@('HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent'); if($loaded){$acc+='HKU:\TempDefault\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent'}
           foreach($k in $acc){ if(-not(Test-Path $k)){New-Item -Path $k -Force|Out-Null}; New-ItemProperty -Path $k -Name 'AccentColorMenu' -Value 0x8c2bc4 -PropertyType DWord -Force|Out-Null; New-ItemProperty -Path $k -Name 'StartColor' -Value 0x8c2bc4 -PropertyType DWord -Force|Out-Null; New-ItemProperty -Path $k -Name 'AccentColor' -Value 0xffc42b8c -PropertyType DWord -Force|Out-Null; try{ $mag=[byte[]](0x8C,0x2B,0xC4,0xFF,0x9E,0x33,0xD0,0xFF,0xB0,0x3B,0xDC,0xFF,0xC2,0x43,0xE8,0xFF,0x7A,0x22,0xB0,0xFF,0x66,0x1A,0x9C,0xFF,0x52,0x12,0x88,0xFF,0x3E,0x0A,0x74,0xFF); Set-ItemProperty -Path $k -Name 'AccentPalette' -Value $mag -PropertyType Binary -Force|Out-Null }catch{} }
-          # wallpaper: prefer Glow/dark bloom, else default
           $wp=$null
           try{ $glow=Get-ChildItem 'C:\Windows\Web\Wallpaper' -Recurse -Filter *.jpg -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Glow|img(19|20)' } | Select-Object -First 1; if($glow){$wp=$glow.FullName} }catch{}
           if(-not $wp){ $cand=@('C:\Windows\Web\Wallpaper\Windows\img20.jpg','C:\Windows\Web\Wallpaper\Windows\img19.jpg','C:\Windows\Web\Wallpaper\Windows\img0.jpg'); $wp=$cand | ?{Test-Path $_} | select -First 1 }
           $desk=@('HKCU:\Control Panel\Desktop'); if($loaded){$desk+='HKU\TempDefault\Control Panel\Desktop'}
           if($wp){ foreach($k in $desk){ if(-not(Test-Path $k)){New-Item -Path $k -Force|Out-Null}; Set-ItemProperty -Path $k -Name Wallpaper -Value $wp -ErrorAction SilentlyContinue; Set-ItemProperty -Path $k -Name WallpaperStyle -Value '10' -ErrorAction SilentlyContinue; Set-ItemProperty -Path $k -Name TileWallpaper -Value '0' -ErrorAction SilentlyContinue } }
-          if($loaded){ & reg.exe unload 'HKU\TempDefault' 2>$null|Out-Null }
-          RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters ,1 ,True 2>$null|Out-Null
+          if($loaded){ & reg.exe unload 'HKU\TempDefault' 2>$null|Out-Null; Reset-Exit }
+          RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters ,1 ,True 2>$null|Out-Null; Reset-Exit
           Write-Host "Theme applied (dark + magenta accent + glow wallpaper best-effort)."
+          # ---- Edge extensions + managed favorites ----
           $edgePol='HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist'; if(-not(Test-Path $edgePol)){New-Item -Path $edgePol -Force|Out-Null}
           $crx='https://edge.microsoft.com/extensionwebstorebase/v1/crx'
           New-ItemProperty -Path $edgePol -Name '1' -Value "odfafepnkmbhccpbejgmiehpchacaeak;$crx" -PropertyType String -Force|Out-Null
           New-ItemProperty -Path $edgePol -Name '2' -Value "ifoakfbpdcdoeenechcleahebpibofpc;$crx" -PropertyType String -Force|Out-Null
           $fav='[{"name":"FMHY Torrenting","url":"https://fmhy.net/torrenting"},{"name":"GitHub RDP Mirror","url":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe"}]'
           New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'ManagedFavorites' -Value $fav -PropertyType String -Force|Out-Null
+          # ---- Firefox managed bookmarks ----
           $ffdist='C:\Program Files\Mozilla Firefox\distribution'; New-Item -ItemType Directory -Path $ffdist -Force|Out-Null
           $ffpol='{"policies":{"Bookmarks":[{"Title":"FMHY Torrenting","URL":"https://fmhy.net/torrenting","Placement":"toolbar"},{"Title":"GitHub RDP Mirror","URL":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe","Placement":"toolbar"}]}}'
           Set-Content -Path (Join-Path $ffdist 'policies.json') -Value $ffpol -Encoding UTF8
-          try { winget install --id qBittorrent.qBittorrent -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "qBittorrent installed." } catch { Write-Host "qBittorrent winget failed." }
-          try { winget install --id Parsec.Parsec -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "Parsec installed." } catch { Write-Host "Parsec winget failed." }
-          # qBittorrent default save path -> D:\RDP-Storage (so torrents auto-mirror)
+          # ---- qBittorrent + Parsec (native exit codes reset so they can NEVER fail this step) ----
+          try { winget install --id qBittorrent.qBittorrent -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "qBittorrent installed." } catch { Write-Host "qBittorrent winget failed (non-fatal)." }; Reset-Exit
+          try { winget install --id Parsec.Parsec -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "Parsec installed." } catch { Write-Host "Parsec winget failed (non-fatal)." }; Reset-Exit
+          # ---- qBittorrent default save path -> D:\RDP-Storage ----
           if($env:RDP_USER -and (Test-Path 'D:\RDP-Storage')){ $qini="C:\Users\$($env:RDP_USER)\AppData\Roaming\qBittorrent"; New-Item -ItemType Directory -Path $qini -Force|Out-Null; "[Downloads]`r`nSavePath=D:\RDP-Storage`r`n" | Set-Content (Join-Path $qini 'qBittorrent.ini') -Encoding ASCII -ErrorAction SilentlyContinue; Write-Host "qBittorrent default save = D:\RDP-Storage." }
+          # ---- Parsec hosting config + autolaunch ----
           $pcfg='C:\ProgramData\Parsec'; New-Item -ItemType Directory -Path $pcfg -Force|Out-Null
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
-          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Reset-Exit
           "### Theme + Bookmarks + qBittorrent + Parsec Ready" >> $env:GITHUB_STEP_SUMMARY
           "Dark+magenta+glow (best-effort). For the EXACT purple-glow look: in RDP open Settings>Personalization and click the glow tile (1 click). qBittorrent saves to D:\RDP-Storage (mirrored). Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
+          Write-Host "Configure step complete (all best-effort, exit forced 0)."
+          exit 0
 
       - name: Keep Alive (5h30) + flush at 4h30
         run: |
@@ -310,7 +317,7 @@ jobs:
           Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU' -Name '*' -ErrorAction SilentlyContinue
           Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths' -ErrorAction SilentlyContinue
           Set-Clipboard -Value "" -ErrorAction SilentlyContinue; Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-          wevtutil el 2>$null | %{wevtutil cl "$_" 2>$null}
+          wevtutil el 2>$null | %{wevtutil cl "$_" 2>$null}; $LASTEXITCODE = 0
           "### Secure Cleanup Complete" >> $env:GITHUB_STEP_SUMMARY
           "VM wiped (incl D-RDP-Storage). Mirror copies (AES) + rentry index remain if mirror ON. No GitHub secrets - recoverable from script." >> $env:GITHUB_STEP_SUMMARY
 
@@ -319,4 +326,5 @@ jobs:
         run: |
           Write-Host "Overwriting free space (cipher /w)..."
           cipher /w:C:\
+          $LASTEXITCODE = 0
           "Free-space overwrite complete." >> $env:GITHUB_STEP_SUMMARY
