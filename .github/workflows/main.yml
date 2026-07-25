@@ -155,37 +155,45 @@ jobs:
           }
           if(-not $acl){ Write-Host "[acl] left ACL unchanged (could not safely read it). If Funnel still fails, regenerate the token with admin rights." }
 
-      # === S1 (NEW): tailnet web link via Tailscale Serve - clickable, NO secret, fully auto ===
+      # === FIX: Setup tailnet web link - serve launched NON-BLOCKING (never hangs) ===
       - name: Setup tailnet web link (Tailscale Serve - clickable, no secret needed)
         run: |
           $ts="C:\Program Files\Tailscale\tailscale.exe"
           $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]})
           Add-Content $env:GITHUB_ENV ("DASH_TOKEN=" + $dashToken)
-          $serveUrl=''
-          for($a=1;$a -le 3;$a++){
-            $out = & $ts serve --bg --yes 7331 2>&1
-            $out | ForEach-Object { Write-Host ("[serve] " + $_) }
-            $LASTEXITCODE=0
-            $stj=$null; try{ $stj=& $ts status --json 2>$null|ConvertFrom-Json -EA Stop }catch{}
-            $dns=if($stj){ $stj.Self.DNSName }else{ $null }
-            if($dns){ $dns=$dns.TrimEnd('.'); $serveUrl = ("https://" + $dns + "/?key=" + $dashToken); break }
-            Write-Host ("[serve] attempt " + $a + ": DNS not ready yet"); Start-Sleep -Seconds 3
+          $serveOut=Join-Path $env:RUNNER_TEMP 'serve.out'; $serveErr=Join-Path $env:RUNNER_TEMP 'serve.err'
+          Remove-Item $serveOut,$serveErr -Force -EA 0
+          # --- NON-BLOCKING: launch serve detached, NEVER wait on it (THIS is what hung before) ---
+          try { Start-Process -FilePath $ts -ArgumentList @('serve','--bg','7331') -RedirectStandardOutput $serveOut -RedirectStandardError $serveErr -WindowStyle Hidden | Out-Null; Write-Host '[serve] launched detached (non-blocking) - step will NOT hang' } catch { Write-Host ('[serve] launch err: ' + $_) }
+          # --- DNSName is ready right after sign-in; poll FAST with a hard 20s cap (each status call itself time-boxed) ---
+          $serveUrl=''; $dns=''
+          $deadline=(Get-Date).AddSeconds(20)
+          while((Get-Date) -lt $deadline){
+            $stj=$null
+            try { $j=Start-Job -ScriptBlock { param($t) & $t status --json 2>$null } -ArgumentList $ts; if(Wait-Job $j -Timeout 4){ $stj=Receive-Job $j | ConvertFrom-Json -EA 0 }; Remove-Job $j -Force -EA 0 } catch { try{ Remove-Job $j -Force -EA 0 }catch{} }
+            if($stj -and $stj.Self.DNSName){ $dns=$stj.Self.DNSName.TrimEnd('.'); break }
+            Start-Sleep -Seconds 2
           }
-          Add-Content $env:GITHUB_ENV ("SERVE_URL=" + $serveUrl)
+          if($dns){ $serveUrl = ('https://' + $dns + '/?key=' + $dashToken) }
+          Add-Content $env:GITHUB_ENV ('SERVE_URL=' + $serveUrl)
+          Start-Sleep -Seconds 2
+          $slog=''; if(Test-Path $serveOut){ $slog=(Get-Content $serveOut -Raw -EA 0) }
+          $serr=''; if(Test-Path $serveErr){ $serr=(Get-Content $serveErr -Raw -EA 0) }
+          if($slog){ Write-Host ('[serve out] ' + (($slog -replace "`r`n",' ').Trim())) }
+          if($serr){ Write-Host ('[serve err] ' + (($serr -replace "`r`n",' ').Trim())) }
           Write-Host '============================================================'
           if($serveUrl){
-            Write-Host '  TAILNET WEB LINK (clickable - open on your LOCAL pc):'
+            Write-Host '  TAILNET WEB LINK (clickable on your LOCAL pc):'
             Write-Host ('  SERVE_WEBAPP_LINK: ' + $serveUrl)
-            Write-Host '  https link -> clickable in this log. Opens the web-app on'
-            Write-Host '  your pc (you are in the tailnet) -> auto RDP, zero typing.'
-            Write-Host '  Live ~1 min after run starts (when Keep Alive hosts it).'
+            Write-Host '  Serve applies in the background; link is live ~1 min after'
+            Write-Host '  the run starts (when Keep Alive hosts the dashboard).'
           } else {
-            Write-Host '  SERVE failed (see [serve] lines). If HTTPS certs are OFF in'
-            Write-Host '  your tailnet DNS settings, turn them ON; else use ghrdp paste.'
+            Write-Host '  DNS name not found within 20s - serve link skipped this run.'
+            Write-Host '  Use the ghrdp paste link in the Show RDP credentials step.'
           }
           Write-Host '============================================================'
-          "### Tailnet web-app link (click on your local pc)" >> $env:GITHUB_STEP_SUMMARY
-          if($serveUrl){ ("**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](" + $serveUrl + ")**  _(live once Keep Alive starts)_") >> $env:GITHUB_STEP_SUMMARY } else { "_Serve failed - use the ghrdp paste link in the Show RDP credentials step._" >> $env:GITHUB_STEP_SUMMARY }
+          '### Tailnet web-app link (click on your local pc)' >> $env:GITHUB_STEP_SUMMARY
+          if($serveUrl){ ('**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](' + $serveUrl + ')**  _(live once Keep Alive starts)_') >> $env:GITHUB_STEP_SUMMARY } else { '_Serve link not ready - use the ghrdp paste link in the Show RDP credentials step._' >> $env:GITHUB_STEP_SUMMARY }
       - name: Enable RDP + harden + open dashboard port (all profiles)
         run: |
           $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
