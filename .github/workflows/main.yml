@@ -951,7 +951,7 @@ jobs:
           if(-not $dashToken){ $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]}) }
           $serveUrl = $env:SERVE_URL
           if($mirrorOn){
-            $b2=[byte[]]::new(20); $rng.GetBytes($b2); $decPw=-join ($b2|%{$alpha[[int]$_ % $alpha.Length]})
+            $rng2=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha2='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b2=[byte[]]::new(20); $rng2.GetBytes($b2); $decPw=-join ($b2|%{$alpha2[[int]$_ % $alpha2.Length]})
             $dlDir="C:\Users\$user\Downloads"; $tempDir="C:\Users\$user\AppData\Local\Temp"
             $roots=@(@{path=$dlDir;rec=$false;min=0;tag='Downloads'},@{path=$tempDir;rec=$true;min=102400;tag='Temp'})
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
