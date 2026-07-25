@@ -220,17 +220,15 @@ jobs:
               $path = '/'
               if($req -match '(?m)^GET\s+(\S+)'){ $path = $Matches[1] }
               $path = ($path -split '\?')[0]
+              $cfg=$null; try{ $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json -ErrorAction Stop }catch{}
               if($path -eq '/emergency'){
                 Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii
                 DLog "emergency triggered"
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}'))
               } elseif($path -eq '/progress' -or $path -eq '/app.js'){
-                $cfg=$null; try{ $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json -ErrorAction Stop }catch{}
                 $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog = Get-Content $ProgressPath -Raw | ConvertFrom-Json -ErrorAction Stop }catch{} }
-                $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
+                $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
-              } elseif($path -eq '/' -or $path -eq '/index.html'){
-                WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
               } else {
                 WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
               }
@@ -239,7 +237,7 @@ jobs:
           }
           EOF
 
-      - name: Write dashboard UI (live tracker)
+      - name: Write dashboard UI (live tracker + credentials panel)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-ui.html" <<'UIEOF'
@@ -328,6 +326,12 @@ jobs:
           .log pre{ font-family:var(--mono); font-size:11px; line-height:1.55; color:#9fe7d6; background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:12px; height:300px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
           .empty{ color:var(--mut); font-family:var(--mono); font-size:12px; padding:18px 4px; }
           .code{ margin-top:14px; font-family:var(--mono); font-size:11px; color:var(--mut); background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:10px; word-break:break-all; }
+          .crow{display:grid;grid-template-columns:46px 1fr 58px;gap:10px;align-items:center;margin:7px 0}
+          .crow .ck{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--mut)}
+          .crow code{font-family:var(--mono);font-size:12px;background:#070b0e;border:1px solid var(--line);border-radius:8px;padding:7px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+          .cp{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;background:#16202a;color:var(--teal);border:1px solid var(--teal-d);border-radius:8px;padding:7px 4px;cursor:pointer}
+          .cp:hover{background:var(--teal-d)}
+          .cp.done{color:var(--green);border-color:#1f6f43}
           @media (max-width:860px){ .grid,.lower{ grid-template-columns:1fr } }
           ::-webkit-scrollbar{width:9px;height:9px} ::-webkit-scrollbar-thumb{background:#26343d;border-radius:9px}
           </style>
@@ -358,6 +362,13 @@ jobs:
                 </div>
               </div>
               <div class="stack">
+                <div class="panel creds">
+                  <div class="lbl" style="margin-bottom:12px">RDP credentials <span style="color:var(--mut);text-transform:none;letter-spacing:0">(click copy)</span></div>
+                  <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
+                  <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
+                  <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
+                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">Visible while the run is alive (even if the GitHub Summary tab is blank). Manual: Win+R → mstsc → paste IP.</p>
+                </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
                   <div class="stats">
                     <div class="tile done"><div class="n" id="cDone">0</div><div class="k">done</div></div>
@@ -401,6 +412,9 @@ jobs:
             function clk(){ var d=new Date(); document.getElementById('clock').textContent=d.toTimeString().slice(0,8); }
             setInterval(clk,1000); clk();
             var logEl=document.getElementById('log');
+            function fallbackCopy(t){ var ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} document.body.removeChild(ta); }
+            function setCreds(c){ if(!c)return; var map={ip:c.ip,user:c.user,pass:c.pass}; ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(!row)return; row.dataset.val=map[k]||''; var code=row.querySelector('code'); if(code)code.textContent=map[k]||'-'; }); }
+            document.querySelectorAll('.cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); var val=row?row.dataset.val:''; if(!val)return; function ok(){ b.textContent='copied'; b.classList.add('done'); setTimeout(function(){b.textContent='copy';b.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }); });
             function render(s){
               if(!s){ return; }
               var now=Date.now(); var ts=s.ts? new Date(s.ts).getTime():0; var age=(now-ts)/1000;
@@ -411,6 +425,7 @@ jobs:
               if(s.ghrdp){ document.getElementById('rdp').href=s.ghrdp; }
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
+              setCreds(s.creds);
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
               document.getElementById('bTotal').textContent=fb(a.bytesTotal); document.getElementById('speed').textContent=fs(a.speedBps);
               document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
@@ -485,7 +500,31 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      - name: Launch dashboard + watcher (detached) + firewall + self-test
+      - name: Write summary helper (prints creds to log + Summary, every step)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/ghrdp-summary.ps1" <<'EOF'
+          param([string]$CfgPath)
+          $ErrorActionPreference='SilentlyContinue'
+          if(-not (Test-Path $CfgPath)){ return }
+          $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
+          $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $dash=$cfg.dashboardUrl; $ghrdp=$cfg.ghrdp
+          $S = $env:GITHUB_STEP_SUMMARY
+          Write-Host "============================================================"
+          Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
+          Write-Host "  Dashboard (live tracker + creds): $dash"
+          Write-Host "  Handler: $ghrdp   Manual: mstsc -> $ip"
+          Write-Host "  LOCAL PC must have Tailscale ON (same tailnet)."
+          Write-Host "  (If the GitHub Summary tab is blank while running, use THIS log view or the dashboard page - both show creds live.)"
+          Write-Host "============================================================"
+          "### RDP Credentials (live - also on the dashboard page)" >> $S
+          "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
+          "**Dashboard (tracker + creds):** [$dash]($dash)  |  **Handler:** ``$ghrdp``  |  **Manual:** mstsc -> ``$ip``" >> $S
+          "LOCAL PC needs Tailscale ON (same tailnet)." >> $S
+          if($cfg.mirror){ "Mirror ON: on the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
+          EOF
+
+      - name: Launch dashboard + watcher (detached) + firewall + self-test + creds
         env:
           MIRROR: ${{ github.event.inputs.mirror_downloads_public }}
         run: |
@@ -507,19 +546,18 @@ jobs:
             $dlDir="C:\Users\$user\Downloads"; $tempDir="C:\Users\$user\AppData\Local\Temp"
             $roots=@(@{path=$dlDir;rec=$false;min=0;tag='Downloads'},@{path=$tempDir;rec=$true;min=102400;tag='Temp'})
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
-            $cfg=@{ editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; ghrdp=$ghrdp; mirror=$true; decPw=$decPw; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=$lib; heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
+            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; dashboardUrl=$redirectUrl; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=$lib; heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
             $cfg | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8
             $wcmd = $q+$ps+$q+' -ExecutionPolicy Bypass -WindowStyle Hidden -File '+$q+$wp+$q+' -CfgPath '+$q+$cfgPath+$q
             try { $wr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$wcmd }; Write-Host "watcher create rv=$($wr.ReturnValue) pid=$($wr.ProcessId)"; $wr.ProcessId|Out-File (Join-Path $sd 'ghrdp_watcher.pid') -Encoding ascii } catch { Write-Host "watcher cim err: $_" }
-          } elseif(-not $mirrorOn) {
-            @{ editCode=''; slug=''; rentryUrl=''; ghrdp=$ghrdp; mirror=$false } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
+          } else {
+            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; dashboardUrl=$redirectUrl; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
           if(Test-Path $sp){
             $scmd = $q+$ps+$q+' -ExecutionPolicy Bypass -WindowStyle Hidden -File '+$q+$sp+$q+' -Ip '+$ip+' -Port '+$port+' -UiDir '+$q+$sd+$q+' -ProgressPath '+$q+$progressPath+$q+' -CfgPath '+$q+$cfgPath+$q+' -EmergencyFlagPath '+$q+$emPath+$q
             try { $sr=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$scmd }; Write-Host "server create rv=$($sr.ReturnValue) pid=$($sr.ProcessId)"; $sr.ProcessId|Out-File (Join-Path $sd 'ghrdp_server.pid') -Encoding ascii } catch { Write-Host "server cim err: $_" }
           }
           Start-Sleep -Seconds 3
-          # ---- definitive self-test: OS-level LISTEN check + HTTP check (up to 24s) ----
           $listenOk=$false; $httpOk=$false; $procAlive=$false; $spid=$null
           $pidf=Join-Path $sd 'ghrdp_server.pid'
           for($i=0;$i -lt 24;$i++){
@@ -538,27 +576,8 @@ jobs:
           Write-Host "HTTP self-test=$httpOk  firewall=$fwOk  mirror=$mirrorOn"
           Write-Host "server_ok file: $okTxt"
           Write-Host "========================"
-          $S = $env:GITHUB_STEP_SUMMARY
-          "### FIRST - your LOCAL PC needs Tailscale ON" >> $S
-          "The RDP IP ``$ip`` is a Tailscale private address. Your own computer must run the Tailscale client, logged into the same tailnet used for the sign-in link above." >> $S
-          "" >> $S
-          "### RDP Credentials" >> $S
-          "**IP:** ``$ip``  **Username:** ``$user``  **Password:** ``$pass``" >> $S
-          "" >> $S
-          "### Connect + live tracker" >> $S
-          "**Dashboard (live upload tracker):** [$redirectUrl]($redirectUrl)  |  **Handler:** paste ``$ghrdp`` in address bar  |  **Manual:** Win+R -> mstsc -> ``$ip`` -> user ``$user`` / pass ``$pass``." >> $S
-          "" >> $S
-          "### Dashboard self-test (read this if the page won't load)" >> $S
-          "| check | result |" >> $S
-          "|---|---|" >> $S
-          "| port 7331 LISTENING (OS) | **$listenOk** |" >> $S
-          "| HTTP self-test | **$httpOk** |" >> $S
-          "| firewall rule present | **$fwOk** |" >> $S
-          "| server process alive | **$procAlive** (pid $spid) |" >> $S
-          "| server log | ``$okTxt`` |" >> $S
-          "" >> $S
-          if($mirrorOn){ "### Mirror: ON - SAVE DATA BEFORE CANCELLING" >> $S; "1. Open the dashboard [$redirectUrl]($redirectUrl) - live % / per-file bars / MB per sec / scrolling log." >> $S; "2. When ready to stop, click the red **UPLOAD EVERYTHING NOW** button." >> $S; "3. Wait until the green banner **ALL UPLOADED - safe to Cancel** appears." >> $S; "4. THEN press **Cancel workflow**. (A 2nd Cancel force-kills immediately.)" >> $S; "Index: https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe" >> $S }
-          else { "### Mirror: OFF" >> $S }
+          # live creds to log + Summary (visible while running, even if Summary tab lags)
+          & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
       - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
         run: |
@@ -591,6 +610,7 @@ jobs:
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
           if(Test-Path 'C:\Program Files\Parsec\parsecd.exe'){ New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Write-Host "Parsec autolaunch set." } else { Write-Host "Parsec exe not found - skipped autolaunch." }
           Reset-Exit
+          & (Join-Path $env:RUNNER_TEMP 'ghrdp-summary.ps1') (Join-Path $env:RUNNER_TEMP 'ghrdp_cfg.json')
           "### Theme + Bookmarks + qBittorrent + Parsec Ready" >> $env:GITHUB_STEP_SUMMARY
           "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. Exact purple-glow wallpaper: in RDP Settings > Personalization click the glow tile (1 click). qBittorrent save path -> set to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
           Write-Host "Configure step complete (no profile touched, exit forced 0)."
@@ -598,6 +618,8 @@ jobs:
 
       - name: Keep Alive (5h30) + flush at 4h30
         run: |
+          # re-print creds at the start so they are in the log while this long step runs
+          & (Join-Path $env:RUNNER_TEMP 'ghrdp-summary.ps1') (Join-Path $env:RUNNER_TEMP 'ghrdp_cfg.json')
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $flushAt=New-TimeSpan -Hours 4 -Minutes 30
           $flushFlag=Join-Path $env:RUNNER_TEMP 'ghrdp_flush.flag'; $start=Get-Date; $flushed=$false
           try {
