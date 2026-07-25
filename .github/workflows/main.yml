@@ -45,7 +45,7 @@ jobs:
           if (-not $url) { Write-Host $txt; throw "Sign-in link not found." }
           Write-Host "TAILSCALE SIGN-IN LINK: $url"
           $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
-          "### Tailscale Sign-in Link" >> $env:GITHUB_STEP_SUMMARY; "" >> $env:GITHUB_STEP_SUMMARY; "[$url]($url)" >> $env:GITHUB_STEP_SUMMARY
+          "### Tailscale Sign-in Link (click to authorize the runner)" >> $env:GITHUB_STEP_SUMMARY; "" >> $env:GITHUB_STEP_SUMMARY; "[$url]($url)" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Wait for Tailscale sign-in
         run: |
@@ -132,7 +132,7 @@ jobs:
           [void]$sb.AppendLine("| # | File | Status | One-click | gofile | Source | Time |"); [void]$sb.AppendLine("|---|---|---|---|---|---|---|")
           if ($idx.Count -eq 0){ [void]$sb.AppendLine("| - | _(none)_ | - | - | - | - | - |") }
           $n=1; foreach($it in $idx){ $oc=if($it.status -eq 'ok'){'[open](ghrdp://dl/'+$it.payload+')'}else{'-'}; $gf=if($it.gofile){'[gofile]('+$it.gofile+')'}else{'-'}; [void]$sb.AppendLine("| $n | "+$it.name+" | "+(Icon $it.status)+" | "+$oc+" | "+$gf+" | "+$it.src+" | "+$it.time+" |"); $n++ }
-          [void]$sb.AppendLine(""); [void]$sb.AppendLine("_✅ uploaded  ⏳ progress  ️ limit(auto-retry)_"); return $sb.ToString() }
+          [void]$sb.AppendLine(""); [void]$sb.AppendLine("_✅ uploaded  ⏳ progress  ⚠️ limit(auto-retry)_"); return $sb.ToString() }
           EOF
 
       - name: Write dashboard server script
@@ -207,19 +207,64 @@ jobs:
               Write-Host "Watcher PID $($wproc.Id); roots=$($roots.Count)"
             }
           }
-          "### RDP Connection Details" >> $env:GITHUB_STEP_SUMMARY; "| Field | Value |" >> $env:GITHUB_STEP_SUMMARY; "|---|---|" >> $env:GITHUB_STEP_SUMMARY
-          "| **Tailscale IP** | ``$ip`` |" >> $env:GITHUB_STEP_SUMMARY; "| **Username** | ``$user`` |" >> $env:GITHUB_STEP_SUMMARY; "| **Password** | ``$pass`` |" >> $env:GITHUB_STEP_SUMMARY; "" >> $env:GITHUB_STEP_SUMMARY
-          "### One-Click Dashboard" >> $env:GITHUB_STEP_SUMMARY; "" >> $env:GITHUB_STEP_SUMMARY
-          if($serverOk){ "1. Click **[$redirectUrl]($redirectUrl)** -> Open RDP + decrypt buttons." >> $env:GITHUB_STEP_SUMMARY } else { "Fallback RDP: ``$ghrdp``" >> $env:GITHUB_STEP_SUMMARY }
-          "" >> $env:GITHUB_STEP_SUMMARY
-          if($mirrorOn){ "### Mirror: ON (real-time: Downloads + Temp + D-RDP-Storage, AES-256)" >> $env:GITHUB_STEP_SUMMARY; "Big files / torrents -> save to **D:\RDP-Storage** (146GB, mirrored). Index: **https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe**" >> $env:GITHUB_STEP_SUMMARY; "Cancel-safe: always() emergency step uploads on cancel." >> $env:GITHUB_STEP_SUMMARY } else { "### Mirror: OFF" >> $env:GITHUB_STEP_SUMMARY }
+          # ==================== LOG (for people who read the log view) ====================
+          Write-Host "============================================================"
+          Write-Host "  RDP IS READY  (session alive 5h 30m)"
+          Write-Host "============================================================"
+          Write-Host "  Tailscale IP : $ip"
+          Write-Host "  Username     : $user"
+          Write-Host "  Password     : $pass"
+          Write-Host "  Dashboard    : $redirectUrl   (running=$serverOk)"
+          Write-Host "  ghrdp link   : $ghrdp"
+          Write-Host "  >>> IMPORTANT: your LOCAL PC must have Tailscale ON"
+          Write-Host "      (same tailnet) or the 100.x IP is unreachable."
+          Write-Host "  >>> The clickable links are in the SUMMARY tab (left side),"
+          Write-Host "      NOT in this log view. Click 'Summary' at top-left."
+          Write-Host "============================================================"
+          # ==================== SUMMARY (the tab you must open) ====================
+          $S = $env:GITHUB_STEP_SUMMARY
+          "### ⚠️ FIRST - your LOCAL PC needs Tailscale ON" >> $S
+          "The RDP IP ``$ip`` is a **Tailscale private address**. To reach it, your own computer must run the **Tailscale client, logged into the same tailnet** you used for the sign-in link above. If Tailscale is not installed locally: get it from tailscale.com/download, log in with the same account, then continue." >> $S
+          "" >> $S
+          "### 🖥️ RDP Credentials (copy these)" >> $S
+          "**Computer / IP:**" >> $S
+          "``````" >> $S
+          "$ip" >> $S
+          "``````" >> $S
+          "**Username:**" >> $S
+          "``````" >> $S
+          "$user" >> $S
+          "``````" >> $S
+          "**Password:**" >> $S
+          "``````" >> $S
+          "$pass" >> $S
+          "``````" >> $S
+          "" >> $S
+          "### 🚀 3 ways to connect (use any one)" >> $S
+          "" >> $S
+          "**✅ Method 1 - Dashboard page (one-click, also shows mirrored files):**" >> $S
+          "👉 **[$redirectUrl]($redirectUrl)**  -> click *Open Remote Desktop* -> in the browser popup click *Open*." >> $S
+          "" >> $S
+          "**✅ Method 2 - ghrdp handler (paste in browser address bar):**" >> $S
+          "``````" >> $S
+          "$ghrdp" >> $S
+          "``````" >> $S
+          "Paste the line above into your browser address bar and press Enter -> click *Open* in the popup. (Needs the one-time local handler installed.)" >> $S
+          "" >> $S
+          "**✅ Method 3 - Manual mstsc (always works, no handler needed):**" >> $S
+          "1. Press **Win + R**, type ``mstsc``, press Enter." >> $S
+          "2. In *Computer* paste ``$ip`` and click **Connect**." >> $S
+          "3. Username = ``$user``" >> $S
+          "4. Password = ``$pass``" >> $S
+          "5. Accept the certificate warning -> you are in." >> $S
+          "" >> $S
+          if($mirrorOn){ "### 📦 Mirror: ON (real-time: Downloads + Temp + D-RDP-Storage, AES-256)" >> $S; "Save big files / torrents to **D:\RDP-Storage** (146GB). Index: **https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe**. Cancel = emergency upload runs." >> $S }
+          else { "### 📦 Mirror: OFF (private mode)" >> $S }
 
       - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
         run: |
-          # ---- DEFENSIVE: never let a best-effort native exit code fail this step ----
           $ErrorActionPreference = 'Continue'
           function Reset-Exit { $script:LASTEXITCODE = 0 }
-          # ---- dark mode + magenta accent + glow wallpaper (Default hive -> RDP user too) ----
           New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null; Reset-Exit
           $defHive='C:\Users\Default\NTUSER.DAT'; $loaded=$false
           if(Test-Path $defHive){ & reg.exe load 'HKU\TempDefault' $defHive 2>$null|Out-Null; Reset-Exit; $loaded=$true }
@@ -235,23 +280,18 @@ jobs:
           if($loaded){ & reg.exe unload 'HKU\TempDefault' 2>$null|Out-Null; Reset-Exit }
           RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters ,1 ,True 2>$null|Out-Null; Reset-Exit
           Write-Host "Theme applied (dark + magenta accent + glow wallpaper best-effort)."
-          # ---- Edge extensions + managed favorites ----
           $edgePol='HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist'; if(-not(Test-Path $edgePol)){New-Item -Path $edgePol -Force|Out-Null}
           $crx='https://edge.microsoft.com/extensionwebstorebase/v1/crx'
           New-ItemProperty -Path $edgePol -Name '1' -Value "odfafepnkmbhccpbejgmiehpchacaeak;$crx" -PropertyType String -Force|Out-Null
           New-ItemProperty -Path $edgePol -Name '2' -Value "ifoakfbpdcdoeenechcleahebpibofpc;$crx" -PropertyType String -Force|Out-Null
           $fav='[{"name":"FMHY Torrenting","url":"https://fmhy.net/torrenting"},{"name":"GitHub RDP Mirror","url":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe"}]'
           New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'ManagedFavorites' -Value $fav -PropertyType String -Force|Out-Null
-          # ---- Firefox managed bookmarks ----
           $ffdist='C:\Program Files\Mozilla Firefox\distribution'; New-Item -ItemType Directory -Path $ffdist -Force|Out-Null
           $ffpol='{"policies":{"Bookmarks":[{"Title":"FMHY Torrenting","URL":"https://fmhy.net/torrenting","Placement":"toolbar"},{"Title":"GitHub RDP Mirror","URL":"https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe","Placement":"toolbar"}]}}'
           Set-Content -Path (Join-Path $ffdist 'policies.json') -Value $ffpol -Encoding UTF8
-          # ---- qBittorrent + Parsec (native exit codes reset so they can NEVER fail this step) ----
           try { winget install --id qBittorrent.qBittorrent -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "qBittorrent installed." } catch { Write-Host "qBittorrent winget failed (non-fatal)." }; Reset-Exit
           try { winget install --id Parsec.Parsec -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null|Out-Null; Write-Host "Parsec installed." } catch { Write-Host "Parsec winget failed (non-fatal)." }; Reset-Exit
-          # ---- qBittorrent default save path -> D:\RDP-Storage ----
           if($env:RDP_USER -and (Test-Path 'D:\RDP-Storage')){ $qini="C:\Users\$($env:RDP_USER)\AppData\Roaming\qBittorrent"; New-Item -ItemType Directory -Path $qini -Force|Out-Null; "[Downloads]`r`nSavePath=D:\RDP-Storage`r`n" | Set-Content (Join-Path $qini 'qBittorrent.ini') -Encoding ASCII -ErrorAction SilentlyContinue; Write-Host "qBittorrent default save = D:\RDP-Storage." }
-          # ---- Parsec hosting config + autolaunch ----
           $pcfg='C:\ProgramData\Parsec'; New-Item -ItemType Directory -Path $pcfg -Force|Out-Null
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
           New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Reset-Exit
