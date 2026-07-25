@@ -83,6 +83,8 @@ jobs:
           Set-ItemProperty -Path "$rdp\WinStations\RDP-Tcp" -Name "MinEncryptionLevel" -Value 3
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Direction Inbound -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
+          # dashboard port open to the Tailscale network (so your LOCAL pc can reach it)
+          New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort 7331 -Protocol TCP -Action Allow -Profile Any -RemoteAddress '100.64.0.0/10' -Enabled True -ErrorAction SilentlyContinue | Out-Null
           & net.exe accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 2>$null | Out-Null; $LASTEXITCODE = 0
 
       - name: Create secure random RDP account + D-RDP-Storage
@@ -113,15 +115,12 @@ jobs:
           Write-Host "  USER = $user"
           Write-Host "  PASS = $pass"
           Write-Host "------------------------------------------------------------"
-          Write-Host "  1) Your PC: Tailscale ON. Win+R -> mstsc -> $ip -> Connect"
-          Write-Host "  2) user $user / pass $pass"
-          Write-Host "  3) INSIDE the RDP desktop DOUBLE-CLICK the icon named"
-          Write-Host "        'Mission Control'   (on the desktop)"
-          Write-Host "     A CONSOLE WINDOW opens and PRINTS live status every 2s"
-          Write-Host "     (you will SEE the server start, or SEE the exact error)."
-          Write-Host "     A browser tab opens to http://127.0.0.1:7331/ automatically."
-          Write-Host "     DO NOT type 127.0.0.1 from your LOCAL pc - it only works"
-          Write-Host "     inside the RDP desktop after you double-click the icon."
+          Write-Host "  DASHBOARD FROM YOUR LOCAL PC (Tailscale ON, same tailnet):"
+          Write-Host "        http://${ip}:7331/"
+          Write-Host "  DASHBOARD FROM INSIDE RDP (after double-click Mission"
+          Write-Host "        Control icon):  http://127.0.0.1:7331/  OR  http://${ip}:7331/"
+          Write-Host "  NOTE: 127.0.0.1 on YOUR pc = your own pc, NOT the runner."
+          Write-Host "        From your pc always use the Tailscale IP above."
           Write-Host "============================================================"
 
       - name: Write mirror lib (shared functions)
@@ -196,33 +195,65 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (PURE listener loop; started by the launcher inside RDP)
+      - name: Write dashboard server script (binds 0.0.0.0 + /diag self-test endpoint)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
           function Start-GhrdpServer {
-          param([int]$Port,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile)
+          param([int]$Port,[string]$BindAddress,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile)
           $ErrorActionPreference='SilentlyContinue'
           $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
           $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui missing</h1>') }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
           function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`nAccess-Control-Allow-Origin: *`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
+          function BuildDiag($cfg){
+            $bindOk = $true
+            $fw = $false; try { $fw = [bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction Stop) } catch {}
+            $tsip = ''; try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {}
+            $selfConnect = $false; $selfErr = ''
+            if($tsip){ try { Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfConnect = $true } catch { $selfErr = "$_" } }
+            $progReadable = $false; try { if(Test-Path $ProgressPath){ Get-Content $ProgressPath -Raw -EA Stop | Out-Null; $progReadable = $true } } catch {}
+            $listen = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+            return [ordered]@{
+              bindAddress = $BindAddress
+              bindOk = $bindOk
+              portListening = $listen
+              firewallRulePresent = $fw
+              tailscaleIp = $tsip
+              selfConnectFromVmViaTailscaleIp = $selfConnect
+              selfConnectError = $selfErr
+              progressFileReadable = $progReadable
+              mirror = [bool]$(if($cfg){$cfg.mirror}else{$false})
+              dashboardFromLocalPc = ("http://{0}:{1}/" -f $tsip,$Port)
+              dashboardFromInsideRdp = ("http://127.0.0.1:{0}/  or  http://{1}:{0}/" -f $Port,$tsip)
+              hints = @(
+                "FROM YOUR LOCAL PC: open http://{0}:{1}/  (NOT 127.0.0.1 - that is your own pc)." -f $tsip,$Port,
+                "Your LOCAL pc must have Tailscale ON and be in the SAME tailnet as this runner.",
+                "If local pc still fails: this VM firewall rule 'ghrdp-dash' present = $fw (must be True).",
+                "If selfConnectFromVmViaTailscaleIp = False: the bind or firewall is blocking the Tailscale interface.",
+                "127.0.0.1 works ONLY from inside the RDP desktop (it is the VM loopback)."
+              )
+            }
+          }
           function HandleOne($client){
             try {
               $stream=$client.GetStream(); $req=ReadReq $stream; $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=$Matches[1] }; $path=($path -split '\?')[0]
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
               if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
+              elseif($path -eq '/diag'){ $d = BuildDiag $cfg; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress))) }
               elseif($path -eq '/progress' -or $path -eq '/app.js'){
                 $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog=Get-Content $ProgressPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{} }
-                $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
+                $tsip=''; try{ $tsip=(& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() }catch{}
+                $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); tailscaleIp=$tsip; localPcUrl=("http://{0}:{1}/" -f $tsip,$Port); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
               } else { WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes }
             } catch { }
             try { $client.Close() } catch {}
           }
-          $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), ([int]$Port)
-          try { $listener.Start() } catch { Set-Content $OkFile ("LISTEN_FAIL: $_") -Encoding ascii; throw }
-          Set-Content $OkFile ("LISTENING pid=$PID port=$Port at " + (Get-Date -f o)) -Encoding ascii
+          $ipObj = [System.Net.IPAddress]::Parse($BindAddress)
+          $listener = New-Object System.Net.Sockets.TcpListener $ipObj, ([int]$Port)
+          try { $listener.Start() } catch { Set-Content $OkFile ("LISTEN_FAIL on {0}: {1}" -f $BindAddress,$_) -Encoding ascii; throw }
+          Set-Content $OkFile ("LISTENING bind={0} pid={1} port={2} at {3}" -f $BindAddress,$PID,$Port,(Get-Date -f o)) -Encoding ascii
           while($true){
             if(Test-Path $FlushFlagPath){ Remove-Item $FlushFlagPath -Force -EA 0 }
             while($listener.Pending()){ $c=$null; try{ $c=$listener.AcceptTcpClient() }catch{}; if($c){ HandleOne $c } }
@@ -231,7 +262,7 @@ jobs:
           }
           EOF
 
-      - name: Write dashboard UI (live tracker + credentials panel)
+      - name: Write dashboard UI (live tracker + creds + DIAGNOSE button)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-ui.html" <<'UIEOF'
@@ -262,11 +293,13 @@ jobs:
           .brand{ display:flex; align-items:baseline; gap:12px; }
           .brand h1{ font-family:var(--disp); font-weight:700; font-size:22px; letter-spacing:-.4px; }
           .brand .tag{ font-family:var(--mono); font-size:11px; color:var(--mut); letter-spacing:.12em; text-transform:uppercase; }
-          .hstat{ display:flex; align-items:center; gap:16px; font-family:var(--mono); font-size:12px; color:var(--mut); }
+          .hstat{ display:flex; align-items:center; gap:12px; font-family:var(--mono); font-size:12px; color:var(--mut); }
           .pill{ display:inline-flex; align-items:center; gap:7px; padding:5px 11px; border-radius:999px; border:1px solid var(--line); font-weight:600; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
           .pill .d{ width:8px; height:8px; border-radius:50%; background:var(--red); }
           .pill.on{ color:var(--teal); border-color:var(--teal-d); }
           .pill.on .d{ background:var(--teal); animation:pulse 1.4s infinite; }
+          .diagbtn{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; background:#16202a; color:var(--amber); border:1px solid #5a4414; border-radius:8px; padding:6px 10px; cursor:pointer; }
+          .diagbtn:hover{ background:#241c0c; }
           @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(55,198,176,.55)} 70%{box-shadow:0 0 0 9px rgba(55,198,176,0)} 100%{box-shadow:0 0 0 0 rgba(55,198,176,0)} }
           .grid{ display:grid; grid-template-columns:1.45fr 1fr; gap:16px; }
           .panel{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line); border-radius:16px; padding:20px; position:relative; overflow:hidden; }
@@ -326,6 +359,12 @@ jobs:
           .cp{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;background:#16202a;color:var(--teal);border:1px solid var(--teal-d);border-radius:8px;padding:7px 4px;cursor:pointer}
           .cp:hover{background:var(--teal-d)}
           .cp.done{color:var(--green);border-color:#1f6f43}
+          .localurl{ margin-top:12px; padding:10px; border-radius:10px; background:#0b1418; border:1px dashed #2c4a52; font-family:var(--mono); font-size:11.5px; color:#9fe7d6; }
+          .localurl b{ color:var(--teal); }
+          .localurl a{ color:var(--teal); }
+          #diagBox{ display:none; margin-top:12px; }
+          #diagBox pre{ font-family:var(--mono); font-size:11px; line-height:1.6; background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:340px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#cfe9e4; }
+          .ok{ color:var(--green); } .bad{ color:var(--red); }
           @media (max-width:860px){ .grid,.lower{ grid-template-columns:1fr } }
           ::-webkit-scrollbar{width:9px;height:9px} ::-webkit-scrollbar-thumb{background:#26343d;border-radius:9px}
           </style>
@@ -334,7 +373,7 @@ jobs:
           <div class="wrap">
             <header>
               <div class="brand"><h1>RDP · Mission Control</h1><span class="tag">live mirror telemetry</span></div>
-              <div class="hstat"><span id="clock">--:--:--</span><span id="alive" class="pill"><span class="d"></span><span id="alivetxt">checking</span></span></div>
+              <div class="hstat"><span id="clock">--:--:--</span><button class="diagbtn" id="diagBtn" type="button">🔍 DIAGNOSE</button><span id="alive" class="pill"><span class="d"></span><span id="alivetxt">checking</span></span></div>
             </header>
             <div class="grid">
               <div class="stack">
@@ -361,7 +400,12 @@ jobs:
                   <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
-                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">This page runs inside your RDP session (the launcher you double-clicked started it). The black console window next to it prints the same status as text - that is your live diagnostic.</p>
+                  <div class="localurl" id="localUrlBox">
+                    <div>🖥️ <b>From YOUR local pc</b> (Tailscale ON, same tailnet):</div>
+                    <div><a id="localUrl" href="#">-</a></div>
+                    <div style="margin-top:6px;color:var(--mut)">⚠️ On your pc, <b>127.0.0.1 = your own pc</b> (not the runner) - that is why it failed. Use the Tailscale URL above instead.</div>
+                  </div>
+                  <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
                 </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
                   <div class="stats">
@@ -408,7 +452,43 @@ jobs:
             var logEl=document.getElementById('log');
             function fallbackCopy(t){ var ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} document.body.removeChild(ta); }
             function setCreds(c){ if(!c)return; var map={ip:c.ip,user:c.user,pass:c.pass}; ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(!row)return; row.dataset.val=map[k]||''; var code=row.querySelector('code'); if(code)code.textContent=map[k]||'-'; }); }
+            function setLocalUrl(u){ if(!u)return; var a=document.getElementById('localUrl'); a.href=u; a.textContent=u; }
             document.querySelectorAll('.cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); var val=row?row.dataset.val:''; if(!val)return; function ok(){ b.textContent='copied'; b.classList.add('done'); setTimeout(function(){b.textContent='copy';b.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }); });
+            function yn(v){ return v? '<span class="ok">PASS</span>' : '<span class="bad">FAIL</span>'; }
+            document.getElementById('diagBtn').addEventListener('click',function(){
+              var box=document.getElementById('diagBox'); var out=document.getElementById('diagOut');
+              box.style.display='block'; out.innerHTML='running diagnostics…';
+              fetch('/diag',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+                var host=location.hostname;
+                var lines=[];
+                lines.push('== SERVER-SIDE SELF TEST (from /diag) ==');
+                lines.push('bind address            : '+d.bindAddress+'   '+yn(d.bindOk));
+                lines.push('port '+ '7331' +' listening       : '+yn(d.portListening));
+                lines.push('firewall rule present   : '+yn(d.firewallRulePresent)+'   (ghrdp-dash, Tailscale subnet)');
+                lines.push('tailscale ip            : '+(d.tailscaleIp||'(none)'));
+                lines.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+(d.selfConnectError?('   err: '+d.selfConnectError):''));
+                lines.push('progress file readable  : '+yn(d.progressFileReadable));
+                lines.push('');
+                lines.push('== CLIENT-SIDE (your browser) ==');
+                lines.push('you opened this page at : '+host);
+                if(host==='127.0.0.1' || host==='localhost'){
+                  lines.push('<span class="bad">NOTE</span>: 127.0.0.1/localhost = THIS machine only.');
+                  lines.push('  -> if you are on your LOCAL pc, 127.0.0.1 is YOUR pc, not the runner.');
+                  lines.push('  -> open instead: '+ (d.dashboardFromLocalPc||('http://'+(d.tailscaleIp||'<tailscale-ip>')+':7331/')));
+                } else {
+                  lines.push('<span class="ok">OK</span>: you are reaching the runner by a real address ('+host+').');
+                }
+                lines.push('');
+                lines.push('== CHECKLIST (local pc cannot connect?) ==');
+                lines.push('1. Tailscale is ON on your LOCAL pc and signed into the SAME tailnet.');
+                lines.push('2. You use http://'+(d.tailscaleIp||'<tailscale-ip>')+':7331/  (NOT 127.0.0.1).');
+                lines.push('3. firewall rule present above = PASS (else the VM blocks the Tailscale subnet).');
+                lines.push('4. self-connect via TS ip above = PASS (else bind is not 0.0.0.0).');
+                lines.push('');
+                lines.push('raw: '+JSON.stringify(d,null,1));
+                out.innerHTML=lines.join('\n');
+              }).catch(function(e){ out.innerHTML='<span class="bad">/diag request failed: '+e+'</span>'; });
+            });
             function render(s){
               if(!s){ return; }
               var now=Date.now(); var ts=s.ts? new Date(s.ts).getTime():0; var age=(now-ts)/1000;
@@ -420,6 +500,7 @@ jobs:
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
               setCreds(s.creds);
+              if(s.localPcUrl){ setLocalUrl(s.localPcUrl); }
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
               document.getElementById('bTotal').textContent=fb(a.bytesTotal); document.getElementById('speed').textContent=fs(a.speedBps);
               document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
@@ -494,7 +575,7 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      - name: Write Mission Control launcher (OBSERVABLE - runs inside your RDP session)
+      - name: Write Mission Control launcher (OBSERVABLE + self-test against Tailscale IP)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
@@ -509,50 +590,55 @@ jobs:
           $flushFlag = Join-Path $sd 'ghrdp_flush.flag'
           $cfg = $null; try { $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json } catch { Write-Host "[FATAL] cannot read config: $_"; Read-Host "press Enter to close"; exit 1 }
           function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), $m) -ForegroundColor $c }
+          $tsip=''; try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {}
           Write-Host ""
           Line Cyan "============================================================"
           Line Cyan "  MISSION CONTROL  -  RDP dashboard + mirror launcher"
           Line Cyan "  This console IS your live diagnostic. Keep it open."
           Line Cyan "============================================================"
-          Line White ("  RDP IP   = {0}" -f $cfg.rdpIp)
-          Line White ("  USER     = {0}" -f $cfg.rdpUser)
-          Line White ("  MIRROR   = {0}" -f $cfg.mirror)
-          Line White ("  DASHBOARD= http://127.0.0.1:{0}/" -f $Port)
+          Line White ("  RDP / Tailscale IP = {0}" -f $tsip)
+          Line White ("  USER               = {0}" -f $cfg.rdpUser)
+          Line White ("  MIRROR             = {0}" -f $cfg.mirror)
+          Line Green ("  FROM YOUR LOCAL PC -> http://{0}:{1}/" -f $tsip,$Port)
+          Line White ("  FROM INSIDE RDP    -> http://127.0.0.1:{0}/  or  http://{1}:{0}/" -f $Port,$tsip)
           Write-Host ""
           if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing: $serverScript"; Read-Host "press Enter to close"; exit 1 }
           Remove-Item $okFile -Force -EA 0
-          # 1) start mirror watcher (background job) if mirror ON
           $wjob=$null
           if($cfg.mirror -and (Test-Path $watcherScript)){
             try { $wjob = Start-Job -FilePath $watcherScript -ArgumentList $CfgPath; Line Green ("[watcher] started job id={0}" -f $wjob.Id) }
             catch { Line Red ("[watcher] Start-Job FAILED: {0}" -f $_) }
           } elseif($cfg.mirror){ Line Red "[watcher] watcher script missing: $watcherScript" }
           else { Line Yellow "[watcher] mirror OFF - no watcher needed" }
-          # 2) start dashboard server (background job) - dot-source server file INSIDE the job
           $sjob=$null
           try {
             $sjob = Start-Job -ScriptBlock {
-              param($ss,$port,$uidir,$prog,$cfgp,$em,$fl,$ok)
+              param($ss,$port,$bind,$uidir,$prog,$cfgp,$em,$fl,$ok)
               $ErrorActionPreference='Continue'
-              try { . $ss; Start-GhrdpServer -Port $port -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }
+              try { . $ss; Start-GhrdpServer -Port $port -BindAddress $bind -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }
               catch { Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii }
-            } -ArgumentList $serverScript,$Port,$sd,$progressPath,$CfgPath,$emFlag,$flushFlag,$okFile
-            Line Green ("[server] started job id={0}" -f $sjob.Id)
+            } -ArgumentList $serverScript,$Port,'0.0.0.0',$sd,$progressPath,$CfgPath,$emFlag,$flushFlag,$okFile
+            Line Green ("[server] started job id={0} (bind 0.0.0.0)" -f $sjob.Id)
           } catch { Line Red ("[server] Start-Job FAILED: {0}" -f $_) }
-          # 3) wait for the listener to come up (read okFile), max 15s
           $up=$false
           for($i=0;$i -lt 30;$i++){
             if(Test-Path $okFile){ $txt=(Get-Content $okFile -Raw).Trim(); if($txt -match 'LISTENING'){ $up=$true; Line Green ("[server] {0}" -f $txt); break } else { Line Red ("[server] {0}" -f $txt); break } }
             if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] job died early: {0}" -f (Receive-Job $sjob -EA 0)); break }
             Start-Sleep -Milliseconds 500
           }
-          if(-not $up){ Line Red "[server] did NOT start listening on $Port - see messages above. Browser will show CONNECTION REFUSED." }
-          # 4) open the browser (only meaningful if server is up, but open anyway so you see the page or the error)
-          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab" } catch { Line Red ("[browser] open failed: {0}" -f $_) } }
-          # 5) OBSERVABLE status loop - prints every 2s, surfaces job deaths + errors
+          if(-not $up){ Line Red "[server] did NOT start - browser will show CONNECTION REFUSED. See messages above." }
+          # DEEP SELF-TEST: can the VM reach itself via the Tailscale ip on this port?
+          if($up -and $tsip){
+            $selfOk=$false; $selfErr=''
+            try { Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 4 | Out-Null; $selfOk=$true } catch { $selfErr="$_" }
+            if($selfOk){ Line Green ("[selftest] PASS - http://{0}:{1}/ reachable -> your LOCAL pc (same tailnet) should load it too." -f $tsip,$Port) }
+            else { Line Red ("[selftest] FAIL - VM cannot reach itself via Tailscale ip {0}:{1} -> {2}" -f $tsip,$Port,$selfErr); Line Red "[selftest] likely cause: bind not 0.0.0.0 OR firewall 'ghrdp-dash' missing for 100.64.0.0/10." }
+          } elseif($up){ Line Yellow "[selftest] skipped - no Tailscale ip found" }
+          $loopOk=$false; try { Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/" -f $Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $loopOk=$true } catch {}
+          Line $(if($loopOk){'Green'}else{'Red'}) ("[selftest] loopback 127.0.0.1:{0} = {1}" -f $Port,$loopOk)
+          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" } catch { Line Red ("[browser] open failed: {0}" -f $_) } }
           Line Cyan "------------------------------------------------------------"
-          Line Cyan "  LIVE STATUS (this window stays open = server stays alive)"
-          Line Cyan "  Close this window to stop the dashboard + watcher."
+          Line Cyan "  LIVE STATUS (window open = server alive; close = stop)"
           Line Cyan "------------------------------------------------------------"
           while($true){
             $sAlive = ($sjob -and $sjob.State -eq 'Running')
@@ -580,14 +666,15 @@ jobs:
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  After RDP login: DOUBLE-CLICK desktop icon 'Mission Control'"
-          Write-Host "  -> a console window prints live status + opens the dashboard"
-          Write-Host "     at http://127.0.0.1:7331/ (inside the RDP desktop only)."
-          Write-Host "  Manual RDP from your PC (Tailscale ON): mstsc -> $ip"
+          Write-Host "  DASHBOARD FROM YOUR LOCAL PC (Tailscale ON, same tailnet):"
+          Write-Host "        http://${ip}:7331/"
+          Write-Host "  (127.0.0.1 works ONLY inside the RDP desktop.)"
+          Write-Host "  Inside RDP: double-click desktop icon 'Mission Control'."
+          Write-Host "  Stuck? click the DIAGNOSE button on the dashboard."
           Write-Host "============================================================"
           "### RDP Credentials" >> $S
           "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
-          "**After RDP login, double-click the desktop icon 'Mission Control'** -> it opens the dashboard at http://127.0.0.1:7331/ AND a live console (your diagnostic).  |  **Manual RDP:** mstsc -> ``$ip`` (your PC needs Tailscale ON)" >> $S
+          "**Dashboard FROM YOUR LOCAL PC** (Tailscale ON, same tailnet): **http://${ip}:7331/**  (do NOT use 127.0.0.1 on your pc - that is your own pc).  |  Inside RDP: double-click the desktop icon 'Mission Control'.  |  Stuck? click **DIAGNOSE** on the dashboard." >> $S
           "_GitHub keeps the Summary tab blank while the job runs and won't expand running steps. Read creds from the finished 'Show RDP credentials' step._" >> $S
           if($cfg.mirror){ "Mirror ON: in the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
           EOF
@@ -623,7 +710,6 @@ jobs:
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
           if(Test-Path 'C:\Program Files\Parsec\parsecd.exe'){ New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Write-Host "Parsec autolaunch set." } else { Write-Host "Parsec exe not found - skipped autolaunch." }
           Reset-Exit
-          # ---- Mission Control desktop shortcut (the observable launcher) ----
           $sd=$env:RUNNER_TEMP
           $cfgPath=Join-Path $sd 'ghrdp_cfg.json'
           $launcher=Join-Path $sd 'ghrdp-launcher.ps1'
@@ -634,7 +720,7 @@ jobs:
           }
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
           "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control Ready" >> $env:GITHUB_STEP_SUMMARY
-          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. **After RDP login, double-click the desktop icon 'Mission Control'** - it opens the dashboard + a live console that prints status/errors every 2s. Exact purple-glow wallpaper: in RDP Settings > Personalization click the glow tile (1 click). qBittorrent save path -> set to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
+          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. **Dashboard FROM YOUR LOCAL PC: http://<tailscale-ip>:7331/** (Tailscale ON, same tailnet). Inside RDP double-click 'Mission Control'. Stuck? click **DIAGNOSE** on the dashboard (deep self-test)." >> $env:GITHUB_STEP_SUMMARY
           Write-Host "Configure step complete (no profile touched, exit forced 0)."
           exit 0
 
@@ -658,20 +744,15 @@ jobs:
           } else {
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          Write-Host "Config written. mirror=$mirrorOn. Dashboard is launched by the Mission Control icon inside RDP."
+          Write-Host "Config written. mirror=$mirrorOn. Dashboard launched by Mission Control icon; reachable from local pc at http://${ip}:7331/"
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
-      # =====================================================================
-      #  KEEP ALIVE = simple sleep only. NO server hosting here (that was the
-      #  fragile/unobservable part). The dashboard + watcher run inside YOUR
-      #  RDP session, started by the Mission Control icon you double-click.
-      # =====================================================================
       - name: Keep Alive (5h30)
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          Write-Host "Session alive for 5h30. Open the dashboard from INSIDE RDP via the Mission Control icon."
+          Write-Host "Session alive 5h30. Local pc dashboard: http://<tailscale-ip>:7331/ . Inside RDP: Mission Control icon."
           while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
           Write-Host "5h30 done."
 
