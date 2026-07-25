@@ -80,7 +80,7 @@ jobs:
           TS_KEY: ${{ secrets.TS_API_KEY }}
         run: |
           $tok = $env:TS_KEY
-          if(-not $tok){ Write-Host "[acl] TS_API_KEY secret not set -> skipping auto-ACL. (Add the secret once to fully automate; until then Funnel must be enabled manually or use the ghrdp paste fallback.)"; exit 0 }
+          if(-not $tok){ Write-Host "[acl] TS_API_KEY secret not set -> auto-ACL skipped. OPEN the Summary tab: it has a step-by-step Sinhala guide WITH clickable links to add the secret once; OR use the ghrdp paste link in the Summary to connect RIGHT NOW with zero typing (no waiting)."; exit 0 }
           $base = 'https://api.tailscale.com/api/v2/tailnet/-/acl'
           $authH = @{ Authorization = ("Bearer " + $tok) }
           # --- read current ACL as text (HuJSON) ---
@@ -718,8 +718,10 @@ jobs:
           }
           EOF
 
-      # === EDIT C: summary - clickable Funnel HYPERLINK when auto-ACL worked; honest fallback when not ===
+      # === EDIT 1: summary - clickable Funnel link when ready; FULL Sinhala guide WITH hyperlinks when secret missing; ghrdp paste works RIGHT NOW ===
       - name: Write summary helper (highlighted ONE-CLICK link in Summary)
+        env:
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-summary.ps1" <<'EOF'
@@ -728,44 +730,60 @@ jobs:
           if(-not (Test-Path $CfgPath)){ return }
           $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
           $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp; $funnel=$cfg.funnelUrl; $ferr=$cfg.funnelErr
+          $repo = $env:REPO
+          $tokenPage  = 'https://login.tailscale.com/admin/settings/keys'
+          $secretPage = 'https://github.com/' + $repo + '/settings/secrets/actions/new'
+          $aclPage    = 'https://login.tailscale.com/admin/acls'
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host '============================================================'
           Write-Host ('  RDP READY  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
           if($funnel){ Write-Host ('  CLICKABLE HYPERLINK (local pc): ' + $funnel) }
-          else       { Write-Host '  CLICKABLE HYPERLINK: missing -> add secret TS_API_KEY (EDIT A) then re-run, OR enable Funnel in ACL once.' }
-          Write-Host ('  FALLBACK (paste in browser bar): ' + $ghrdp)
+          else       { Write-Host '  CLICKABLE HYPERLINK: not yet -> see the Summary tab guide (links inside) OR use the ghrdp paste to connect NOW.' }
+          Write-Host ('  CONNECT NOW (paste in browser bar): ' + $ghrdp)
           Write-Host '============================================================'
-          '### RDP is ready' >> $S
+          '### RDP සූදානම් 🎯' >> $S
           '' >> $S
           if($funnel){
-            '#### 1) CLICK this hyperlink on your LOCAL pc (opens the web-app, auto-connects RDP, zero typing):' >> $S
+            '#### 1) ඔයාගේ PC එකේ මේ hyperlink එක click කරන්න (web-app එක open වෙලා RDP auto-connect වෙනවා, type කරන්න කිසිවක් නෑ):' >> $S
             '' >> $S
             ('**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](' + $funnel + ')**') >> $S
             '' >> $S
             ('Copyable: `' + $funnel + '`') >> $S
             '' >> $S
-            'This https link is the clickable hyperlink (GitHub cannot make a ghrdp:// link clickable - it strips custom schemes - so the web-app link is the https one). On a brand-new PC the web-app shows a one-time connector installer; after that every click auto-connects with no typing. Tick Always-allow on the browser prompt once.' >> $S
+            'අලුත් PC එකක නම් පළමු පාර web-app එක connector installer එකක් පෙන්නනවා (Download + Run with PowerShell එක පාරක්); ඊට පස්සේ හැම click එකක්ම auto-connect. Browser popup එකේ Always-allow එක පාරක් tick කරන්න.' >> $S
             '' >> $S
           } else {
-            '#### 1) Clickable hyperlink not ready yet' >> $S
+            '#### 🔑 Clickable hyperlink එක ලබා ගන්න - පියවරෙන් පියවර (එක පාරක් විතරයි, ඊට පස්සේ සදහටම auto)' >> $S
             '' >> $S
-            'To get the clickable https web-app link **fully automatically**, add the GitHub secret **TS_API_KEY** once (a Tailscale access token from https://login.tailscale.com/admin/settings/keys) and re-run - the workflow then enables Funnel itself (EDIT A). Or enable Funnel once manually at https://login.tailscale.com/admin/acls by adding `"nodeAttrs":[{"target":["*"],"attr":["funnel"]}]`.' >> $S
+            'මේ පියවර ටික **එකම එක වතාවක්** විතරයි කරන්න ඕන. ඊට පස්සේ හැම run එකකම workflow එකම ඉබේ Funnel ON කරලා clickable link එක දෙනවා.' >> $S
             '' >> $S
-            if($ferr){ ('Last Funnel error from the runner: `' + $ferr + '`') >> $S; '' >> $S }
+            '**පියවර 1 - අලුත් code commit කරන්න:** මේ file එකේ EDIT 1 + EDIT 2 changes ටික ඔයාගේ repo එකට commit/push කරන්න (දැනටමත් කරලා නම් ඊළඟ පියවරට යන්න).' >> $S
+            '' >> $S
+            ('**පියවර 2 - Tailscale API token එකක් හදාගන්න:** මේ link එක click කරන්න → **[Tailscale Access Tokens පිටුව](' + $tokenPage + ')** → **Access tokens** කොටසේ **Generate access token** ඔබන්න → නම `ghrdp` දෙන්න, expiry පුළුවන් තරම් වැඩියෙන් → Generate → `tskey-api-...` token එක **copy** කරගන්න (ආයේ පේන්නේ නෑ).') >> $S
+            '' >> $S
+            ('**පියවර 3 - Token එක GitHub secret එකක් විදිහට දාන්න:** මේ link එක click කරන්න (ඒක ඔයාගේ repo එකේ secret page එකටම යනවා) → **[GitHub Secrets පිටුව](' + $secretPage + ')** → **Name** = `TS_API_KEY` (capital අකුරින්) → **Value** = copy කරපු token එක paste → **Add secret**.') >> $S
+            '' >> $S
+            '**පියවර 4 - Workflow එක re-run කරන්න:** Actions tab → **Run workflow** → Tailscale sign-in link එක click කරන්න. මේ පාර Auto-enable Funnel step එක API එක හරහා ACL එක update කරලා Funnel ON කරනවා.' >> $S
+            '' >> $S
+            '**පියවර 5 - විඳගන්න:** Summary tab එකේ දැන් ඉහළ **නිල් clickable hyperlink** එක (`>>> OPEN RDP WEB-APP FROM YOUR PC <<<`) එනවා → ඒක click → web-app load → zero-typing RDP. 🎉' >> $S
+            '' >> $S
+            ('> Secret add කරන්න බෑ නම් **manual** විදිහටත් පුළුවන්: **[Tailscale ACL පිටුව](' + $aclPage + ')** → ACL JSON එකට `"nodeAttrs":[{"target":["*"],"attr":["funnel"]}]` merge කරලා Save → re-run.') >> $S
+            '' >> $S
+            if($ferr){ ('Runner එකෙන් අන්තිම Funnel error: `' + $ferr + '`') >> $S; '' >> $S }
           }
-          '#### 2) ZERO-TYPING RDP right now (GitHub blocks custom-scheme hyperlinks, so PASTE this in your LOCAL browser address bar + Enter, then click Open once):' >> $S
+          '#### 2) දැන්ම RDP යන්න (secret add කරනකන් wait කරන්න ඕනෑ නෑ) - මේක ඔයාගේ LOCAL browser address bar එකේ PASTE කරලා Enter, ඊට පස්සේ Open එක පාරක් click:' >> $S
           '' >> $S
           '```' >> $S
           $ghrdp >> $S
           '```' >> $S
           '' >> $S
-          'This opens RDP with the password auto-filled (no IP/user/password typing). It is a paste, not a hyperlink, only because GitHub refuses to render ghrp:// as a link - the clickable hyperlink is method 1 above.' >> $S
+          'මේක RDP එක password auto-fill කරලා open කරනවා (IP/user/password type කරන්න ඕනෑ නෑ). GitHub custom-scheme links (`ghrdp://`) clickable hyperlink විදිහට render කරන්නේ නෑ (ක GitHub rule එකක්) - ඒක නිසා මේක paste එකක්; **clickable hyperlink** එක ඉහළ පියවර 1 හෝ 5 න් ලැබෙනවා.' >> $S
           '' >> $S
-          '#### 3) Manual mstsc (reference only)' >> $S
+          '#### 3) Manual mstsc (reference විතරයි)' >> $S
           '' >> $S
           ('IP: ' + $ip + '   User: ' + $user + '   Pass: ' + $pass) >> $S
           '' >> $S
-          if($cfg.mirror){ ('Mirror ON: inside RDP open the dashboard and click UPLOAD-EVERYTHING-NOW, wait for the green banner, then Cancel. Index: ' + $cfg.rentryUrl) >> $S }
+          if($cfg.mirror){ ('Mirror ON: RDP ඇතුළේ dashboard එකේ UPLOAD-EVERYTHING-NOW click → කොළ banner → Cancel. Index: ' + $cfg.rentryUrl) >> $S }
           EOF
 
       # === EDIT 3: installer part - robust, self-verifying, friendly (no admin, first-time safe) ===
