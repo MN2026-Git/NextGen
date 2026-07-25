@@ -688,25 +688,32 @@ jobs:
           $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
           $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp; $funnel=$cfg.funnelUrl
           $S = $env:GITHUB_STEP_SUMMARY
-          Write-Host "============================================================"
-          Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          if($funnel){ Write-Host "  ONE-CLICK RDP (click on your pc): $funnel" }
-          Write-Host "============================================================"
-          "### 🚀 ONE-CLICK RDP (no typing - click on YOUR pc)" >> $S
+          Write-Host '============================================================'
+          Write-Host ('  RDP READY  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
+          if($funnel){ Write-Host ('  CLICKABLE RDP LINK: ' + $funnel) }
+          Write-Host ('  ZERO-TYPING FROM YOUR PC: paste this in your browser address bar: ' + $ghrdp)
+          Write-Host '============================================================'
+          '### RDP is ready' >> $S
+          '' >> $S
+          '#### Connect from YOUR pc with ZERO typing' >> $S
+          '' >> $S
+          'Click the copy button on the box below, paste it into your LOCAL browser address bar, press Enter, then click Open on the prompt (first time only). Your installed handler fills the credentials and opens RDP automatically - you never type IP, user or password:' >> $S
+          '' >> $S
+          '```' >> $S
+          $ghrdp >> $S
+          '```' >> $S
+          '' >> $S
           if($funnel){
-            "" >> $S
-            "👉 **[$funnel]($funnel)**" >> $S
-            "" >> $S
-            "Click the link above **on your local pc**. It opens the dashboard, which **auto-fires your RDP handler** -> RDP connects with the password already filled (zero typing). The **first time** your browser asks *“Open app?”* -> tick **Always allow** + **Open**; after that it is fully automatic." >> $S
-            "" >> $S
-            "_If the auto-open does not trigger, the same page shows a purple **Open RDP now** button._" >> $S
-          } else {
-            "_Funnel link not ready yet - open the Mission Control console inside RDP and copy the ONE-CLICK link from there, or wait and refresh the Summary._" >> $S
+            '#### Or click this link (when available):' >> $S
+            '' >> $S
+            ('[OPEN RDP](' + $funnel + ')') >> $S
+            '' >> $S
           }
-          "" >> $S
-          "### RDP Credentials (for reference / manual mstsc)" >> $S
-          "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
-          if($cfg.mirror){ "Mirror ON: in the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
+          '#### Credentials (reference / manual mstsc)' >> $S
+          '' >> $S
+          ('IP: ' + $ip + '   User: ' + $user + '   Pass: ' + $pass) >> $S
+          '' >> $S
+          if($cfg.mirror){ ('Mirror ON: inside RDP open the dashboard and click UPLOAD-EVERYTHING-NOW, wait for the green banner, then Cancel. Index: ' + $cfg.rentryUrl) >> $S }
           EOF
 
       - name: Configure theme + bookmarks + apps + Mission Control shortcut
