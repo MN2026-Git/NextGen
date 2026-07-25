@@ -124,7 +124,7 @@ jobs:
             exit 0
           }
           $base = 'https://api.tailscale.com/api/v2/tailnet/-/acl'
-          $authH = @{ Authorization = ("Bearer " + $tok) }
+          $authH = @{ Authorization = ("Bearer " + $tok); Accept = 'application/json' }
           $txt = $null
           try { $r = Invoke-WebRequest -Uri $base -Headers $authH -UseBasicParsing -TimeoutSec 30; $txt = $r.Content } catch { Write-Host "[acl] GET failed: $($_.Exception.Message)" }
           $acl = $null
@@ -515,6 +515,11 @@ jobs:
                   <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
+                  <div style="margin-top:12px">
+                    <div class="lbl" style="margin-bottom:8px">One-click RDP (clickable ghrdp link - works inside this webapp)</div>
+                    <a id="ghrdpLink" href="#" style="display:block;font-family:var(--mono);font-size:11.5px;color:var(--teal);background:#070b0e;border:1px solid var(--teal-d);border-radius:9px;padding:10px 12px;word-break:break-all;text-decoration:none;transition:background .15s ease">ghrdp://…</a>
+                    <p style="font-family:var(--mono);font-size:10px;color:var(--mut);margin-top:7px;line-height:1.5">This ghrdp link is clickable HERE (inside the webapp) and on your local pc after the connector is installed. On GitHub log/Summary it cannot be a hyperlink (GitHub strips custom schemes) - that is a GitHub rule, not a bug.</p>
+                  </div>
                   <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
                 </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
@@ -564,6 +569,7 @@ jobs:
             function fallbackCopy(t){ var ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} document.body.removeChild(ta); }
             function copyBtn(btn,val){ function ok(){ btn.textContent='copied'; btn.classList.add('done'); setTimeout(function(){btn.textContent='copy';btn.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }
             function setCreds(c){ if(!c)return; var map={ip:c.ip,user:c.user,pass:c.pass}; ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(!row)return; row.dataset.val=map[k]||''; var code=row.querySelector('code'); if(code)code.textContent=map[k]||'-'; }); }
+            function setGhrdp(u){ var a=document.getElementById('ghrdpLink'); if(a){ a.href = u || '#'; a.textContent = u || 'ghrdp://…'; } }
             document.querySelectorAll('.crow .cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); copyBtn(b, row?row.dataset.val:''); }); });
             function setMode(loop){ var m=document.getElementById('mode'); if(loop){ m.className='mode loop'; m.textContent='◉ RDP / loopback'; } else { m.className='mode funnel'; m.textContent='⬈ LOCAL PC (auto-connect)'; } }
             function fireAutoConnect(url){
@@ -611,7 +617,7 @@ jobs:
               if(s.ghrdp){ ghrdpUrl=s.ghrdp; document.getElementById('rdp').href=s.ghrdp; document.getElementById('autoManual').href=s.ghrdp; }
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
-              setCreds(s.creds); setMode(!!s.viaLoopback);
+              setCreds(s.creds); setGhrdp(s.ghrdp); setMode(!!s.viaLoopback);
               // AUTO-CONNECT only when viewed from the LOCAL pc (Funnel), never from inside RDP loopback
               if(s.ghrdp && !s.viaLoopback){ fireAutoConnect(s.ghrdp); }
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
