@@ -344,12 +344,12 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (token gate + funnel-aware + accurate diag)
+      - name: Write dashboard server script (source-IP aware token gate + time-bounded)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
           function Start-GhrdpServer {
-          param([int]$Port,[string]$BindAddress,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile)
+          param([int]$Port,[string]$BindAddress,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile,[int]$LimitMinutes=330)
           $ErrorActionPreference='SilentlyContinue'
           $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
           $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui missing</h1>') }
@@ -358,43 +358,39 @@ jobs:
             $qp=@{}; if($lines[0] -match '\?(.+)\s'){ foreach($kv in ($Matches[1] -split '&')){ $p=$kv -split '='; if($p.Length -eq 2){ $qp[$p[0].ToLower()]=[uri]::UnescapeDataString($p[1]) } } }
             return @{ headers=$h; query=$qp }
           }
-          function IsLoopbackHost($parsed){
-            $host_ = $parsed.headers['host']; if($host_){ $host_ = ($host_ -split ':')[0] }
-            $xfh = $parsed.headers['x-forwarded-host']; $xff = $parsed.headers['x-forwarded-for']
-            $loopHost = ($host_ -eq '127.0.0.1') -or ($host_ -eq 'localhost') -or ($host_ -eq '[::1]')
-            return ($loopHost -and -not $xfh -and -not $xff)
+          # === source-IP aware: loopback + Tailscale CGNAT (100.64/10) = trusted (already Tailscale-authed) ===
+          function Is-Trusted($client){
+            try {
+              $addr = $client.Client.RemoteEndPoint.Address
+              if($addr.IsLoopback){ return $true }
+              $b = $addr.GetAddressBytes()
+              if($b.Length -eq 4 -and $b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127){ return $true }
+            } catch {}
+            return $false
           }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
           function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}401{'Unauthorized'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
-          function BuildDiag($cfg,$parsed){
-            $bindOk = $true
-            $fw = $false; try { $fw = [bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction Stop) } catch {}
-            $tsip = $cfg.rdpIp; if(-not $tsip){ try { $tsip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null).Trim() } catch {} }
-            $selfConnect = $false; $selfErr = ''
-            if($tsip){ try { Invoke-WebRequest -Uri ("http://{0}:{1}/?key={2}" -f $tsip,$Port,$cfg.dashToken) -UseBasicParsing -TimeoutSec 4 | Out-Null; $selfConnect = $true } catch { $selfErr = "$_" } }
-            $listen = [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
-            $loopback = IsLoopbackHost $parsed
-            return [ordered]@{
-              bindAddress = $BindAddress; bindOk = $bindOk; portListening = $listen; firewallRulePresent = $fw
-              tailscaleIp = $tsip; selfConnectFromVmViaTailscaleIp = $selfConnect; selfConnectError = $selfErr
-              funnelUrl = $(if($cfg.funnelUrl){$cfg.funnelUrl}else{'(funnel not enabled - see Mission Control console)'})
-              requestCameViaLoopback = $loopback; requestHost = $parsed.headers['host']
-              note = "Direct Tailscale-IP access from a local pc is blocked by GitHub runner network policy. Use the FUNNEL url (token-gated) for local-pc access; the dashboard then AUTO-FIRES the ghrdp handler for zero-typing RDP."
-            }
-          }
           function HandleOne($client){
             try {
               $stream=$client.GetStream(); $req=ReadReq $stream; $parsed=ParseHeaders $req
               $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=($Matches[1] -split '\?')[0] }
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
-              $loop = IsLoopbackHost $parsed
-              $keyOk = $loop -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
-              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - missing or bad ?key=. Use the ONE-CLICK RDP link in the GitHub Summary tab (it carries the key)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
+              $trusted = Is-Trusted $client
+              $keyOk = $trusted -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
+              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - unauthorized (not from loopback/tailnet and no valid ?key=)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
               if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
-              elseif($path -eq '/diag'){ $d = BuildDiag $cfg $parsed; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress))) }
+              elseif($path -eq '/diag'){
+                $bindOk=$true; $fw=$false; try{$fw=[bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -EA Stop)}catch{}
+                $tsip=$cfg.rdpIp; $selfOk=$false; $selfErr=''
+                if($tsip){ try{ Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfOk=$true }catch{ $selfErr="$_" } }
+                $listen=[bool](Get-NetTCPConnection -LocalPort $Port -State Listen -EA 0)
+                $d=[ordered]@{ bindAddress=$BindAddress; bindOk=$bindOk; portListening=$listen; firewallRulePresent=$fw; tailscaleIp=$tsip; requestTrusted=$trusted; requestHost=$parsed.headers['host']; note='loopback + Tailscale CGNAT requests are auto-trusted (no token needed); public/Funnel requests need ?key=.' }
+                WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress)))
+              }
+              elseif($path -eq '/install.ps1'){ $ip2=Join-Path $UiDir 'ghrdp-install.ps1'; if(Test-Path $ip2){ WriteResp $stream 200 'application/octet-stream' ([System.IO.File]::ReadAllBytes($ip2)) } else { WriteResp $stream 404 'text/plain' ([System.Text.Encoding]::UTF8.GetBytes('installer missing')) } }
               elseif($path -eq '/progress' -or $path -eq '/app.js'){
                 $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog=Get-Content $ProgressPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{} }
-                $obj=[ordered]@{ serverTs=(Get-Date -f o); viaLoopback=$loop; funnelUrl=$(if($cfg.funnelUrl){$cfg.funnelUrl}else{''}); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
+                $obj=[ordered]@{ serverTs=(Get-Date -f o); viaLoopback=$trusted; ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
               } else { WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes }
             } catch { }
@@ -404,11 +400,13 @@ jobs:
           $listener = New-Object System.Net.Sockets.TcpListener $ipObj, ([int]$Port)
           try { $listener.Start() } catch { Set-Content $OkFile ("LISTEN_FAIL on {0}: {1}" -f $BindAddress,$_) -Encoding ascii; throw }
           Set-Content $OkFile ("LISTENING bind={0} pid={1} port={2} at {3}" -f $BindAddress,$PID,$Port,(Get-Date -f o)) -Encoding ascii
-          while($true){
+          $start=Get-Date; $limit=(New-TimeSpan -Minutes $LimitMinutes)
+          while(((Get-Date)-$start) -lt $limit){
             if(Test-Path $FlushFlagPath){ Remove-Item $FlushFlagPath -Force -EA 0 }
             while($listener.Pending()){ $c=$null; try{ $c=$listener.AcceptTcpClient() }catch{}; if($c){ HandleOne $c } }
             Start-Sleep -Milliseconds 200
           }
+          try { $listener.Stop() } catch {}
           }
           EOF
 
@@ -963,7 +961,7 @@ jobs:
           Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
-      - name: Keep Alive (5h30) - hosts dashboard + watcher (so local-pc web link works)
+      - name: Keep Alive (5h30) - dashboard FOREGROUND (reliable) + watcher job
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
@@ -971,18 +969,16 @@ jobs:
           $progressPath=Join-Path $sd 'ghrdp_progress.json'; $emFlag=Join-Path $sd 'ghrdp_emergency.flag'; $flushFlag=Join-Path $sd 'ghrdp_flush.flag'; $okFile=Join-Path $sd 'ghrdp_server_ok.txt'
           $cfg=Get-Content $cfgPath -Raw|ConvertFrom-Json
           Remove-Item $okFile -Force -EA 0
+          # watcher as background job (mirror only) - RDP/dashboard do NOT depend on it
           $wjob=$null
-          if($cfg.mirror -and (Test-Path $watcherScript)){ try{ $wjob=Start-Job -FilePath $watcherScript -ArgumentList $cfgPath; Write-Host "[watcher] job $($wjob.Id)" }catch{ Write-Host "[watcher] err $_" } }
-          $sjob=$null
-          try{ $sjob=Start-Job -ScriptBlock { param($ss,$port,$bind,$uidir,$prog,$cfgp,$em,$fl,$ok) $ErrorActionPreference='Continue'; try{ . $ss; Start-GhrdpServer -Port $port -BindAddress $bind -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }catch{ Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii } } -ArgumentList $serverScript,7331,'0.0.0.0',$sd,$progressPath,$cfgPath,$emFlag,$flushFlag,$okFile; Write-Host "[server] job $($sjob.Id)" }catch{ Write-Host "[server] err $_" }
-          for($i=0;$i -lt 30;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ Write-Host "[server] up on 7331"; break }; Start-Sleep -Milliseconds 500 }
-          Write-Host "Dashboard alive: 127.0.0.1:7331 (inside RDP) AND the tailnet web link printed in earlier steps. Keeping alive 5h30..."
-          $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          while(((Get-Date)-$start) -lt $limit){
-            if($sjob -and $sjob.State -ne 'Running'){ Write-Host "[server] died: $(Receive-Job $sjob -EA 0)" }
-            if($wjob -and $wjob.State -ne 'Running'){ Write-Host "[watcher] died: $(Receive-Job $wjob -EA 0)" }
-            Start-Sleep -Seconds 60
-          }
+          if($cfg.mirror -and (Test-Path $watcherScript)){ try{ $wjob=Start-Job -FilePath $watcherScript -ArgumentList $cfgPath; Write-Host "[watcher] background job $($wjob.Id)" }catch{ Write-Host "[watcher] err $_" } }
+          # === server in FOREGROUND = same process = reliably binds 7331 and stays alive 5h30 (fixes 502 / connection-refused) ===
+          if(-not (Test-Path $serverScript)){ throw "server script missing" }
+          . $serverScript
+          Write-Host "[server] starting FOREGROUND on 0.0.0.0:7331 (this step blocks 5h30 = keeps it alive; loopback+tailnet auto-trusted, no token needed)"
+          Start-GhrdpServer -Port 7331 -BindAddress '0.0.0.0' -UiDir $sd -ProgressPath $progressPath -CfgPath $cfgPath -EmergencyFlagPath $emFlag -FlushFlagPath $flushFlag -OkFile $okFile -LimitMinutes 330
+          if($wjob){ try{ Stop-Job $wjob -EA 0; Remove-Job $wjob -Force -EA 0 }catch{} }
+          Write-Host "Keep Alive window closed."
 
       - name: Emergency upload on cancel (always)
         if: ${{ always() && github.event.inputs.mirror_downloads_public == 'true' }}
