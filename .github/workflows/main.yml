@@ -115,10 +115,13 @@ jobs:
           Write-Host "------------------------------------------------------------"
           Write-Host "  1) Your PC: Tailscale ON. Win+R -> mstsc -> $ip -> Connect"
           Write-Host "  2) user $user / pass $pass"
-          Write-Host "  3) INSIDE the RDP desktop, open a browser and go to:"
-          Write-Host "        http://127.0.0.1:7331/"
-          Write-Host "     (dashboard answers ONLY from inside the RDP desktop,"
-          Write-Host "      NOT from your local PC. It is live while Keep Alive runs.)"
+          Write-Host "  3) INSIDE the RDP desktop DOUBLE-CLICK the icon named"
+          Write-Host "        'Mission Control'   (on the desktop)"
+          Write-Host "     A CONSOLE WINDOW opens and PRINTS live status every 2s"
+          Write-Host "     (you will SEE the server start, or SEE the exact error)."
+          Write-Host "     A browser tab opens to http://127.0.0.1:7331/ automatically."
+          Write-Host "     DO NOT type 127.0.0.1 from your LOCAL pc - it only works"
+          Write-Host "     inside the RDP desktop after you double-click the icon."
           Write-Host "============================================================"
 
       - name: Write mirror lib (shared functions)
@@ -193,15 +196,13 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (defines Start-GhrdpServer; dot-sourced by Keep Alive)
+      - name: Write dashboard server script (PURE listener loop; started by the launcher inside RDP)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
           function Start-GhrdpServer {
-          param([int]$Port,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[int]$LimitMinutes,[int]$FlushAtMinutes,[string]$WatcherScript)
+          param([int]$Port,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile)
           $ErrorActionPreference='SilentlyContinue'
-          $diag = Join-Path $UiDir 'ghrdp_server_ok.txt'
-          function DLog($m){ Add-Content $diag ("{0} {1}" -f (Get-Date -f 'HH:mm:ss'), $m) }
           $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
           $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui missing</h1>') }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
@@ -210,30 +211,23 @@ jobs:
             try {
               $stream=$client.GetStream(); $req=ReadReq $stream; $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=$Matches[1] }; $path=($path -split '\?')[0]
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
-              if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; DLog "emergency triggered"; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
+              if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
               elseif($path -eq '/progress' -or $path -eq '/app.js'){
                 $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $prog=Get-Content $ProgressPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{} }
                 $obj=[ordered]@{ serverTs=(Get-Date -f o); ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
                 WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
               } else { WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes }
-            } catch { DLog "req err: $_" }
+            } catch { }
             try { $client.Close() } catch {}
           }
-          $job=$null
-          if($WatcherScript -and (Test-Path $WatcherScript)){ try{ $job=Start-Job -FilePath $WatcherScript -ArgumentList $CfgPath; DLog "watcher job started id=$($job.Id)" }catch{ DLog "watcher Start-Job failed: $_" } }
-          $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Any), ([int]$Port)
-          try { $listener.Start(); DLog "TcpListener STARTED 0.0.0.0:$Port (foreground, tied to Keep Alive step)" } catch { DLog "TcpListener START FAILED: $_"; if($job){Stop-Job $job -EA 0; Remove-Job $job -Force -EA 0}; return }
-          $start=Get-Date; $limit=(New-TimeSpan -Minutes $LimitMinutes); $flushAt=(New-TimeSpan -Minutes $FlushAtMinutes); $flushed=$false
-          $selfOk=$false; try{ Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfOk=$true }catch{}; DLog "local self-test=$selfOk"
-          while(((Get-Date)-$start) -lt $limit){
-            if((-not $flushed) -and (((Get-Date)-$start) -ge $flushAt)){ "flush"|Out-File $FlushFlagPath -Encoding ascii; $flushed=$true; DLog "flush flag written" }
-            if($job -and $job.State -ne 'Running'){ DLog "watcher job state=$($job.State) - respawning"; try{ Receive-Job $job -EA 0 | %{ DLog "watcher-last: $_" } }catch{}; try{ Remove-Job $job -Force -EA 0 }catch{}; try{ $job=Start-Job -FilePath $WatcherScript -ArgumentList $CfgPath; DLog "watcher respawned id=$($job.Id)" }catch{ DLog "watcher respawn failed: $_" } }
+          $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), ([int]$Port)
+          try { $listener.Start() } catch { Set-Content $OkFile ("LISTEN_FAIL: $_") -Encoding ascii; throw }
+          Set-Content $OkFile ("LISTENING pid=$PID port=$Port at " + (Get-Date -f o)) -Encoding ascii
+          while($true){
+            if(Test-Path $FlushFlagPath){ Remove-Item $FlushFlagPath -Force -EA 0 }
             while($listener.Pending()){ $c=$null; try{ $c=$listener.AcceptTcpClient() }catch{}; if($c){ HandleOne $c } }
-            Start-Sleep -Milliseconds 250
+            Start-Sleep -Milliseconds 200
           }
-          DLog "limit reached, stopping listener + watcher"
-          try { $listener.Stop() } catch {}
-          if($job){ try{ Stop-Job $job -EA 0 }catch{}; try{ Remove-Job $job -Force -EA 0 }catch{} }
           }
           EOF
 
@@ -367,7 +361,7 @@ jobs:
                   <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
-                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">You are viewing this from inside the RDP desktop (127.0.0.1) - good. The GitHub Summary tab stays blank until the job ends (a GitHub limitation).</p>
+                  <p style="font-family:var(--mono);font-size:10.5px;color:var(--mut);margin-top:10px;line-height:1.5">This page runs inside your RDP session (the launcher you double-clicked started it). The black console window next to it prints the same status as text - that is your live diagnostic.</p>
                 </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
                   <div class="stats">
@@ -449,7 +443,7 @@ jobs:
           </html>
           UIEOF
 
-      - name: Write mirror watcher script (runs as a JOB inside Keep Alive)
+      - name: Write mirror watcher script
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
         shell: bash
         run: |
@@ -500,6 +494,80 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
+      - name: Write Mission Control launcher (OBSERVABLE - runs inside your RDP session)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
+          param([string]$CfgPath,[int]$Port=7331)
+          $ErrorActionPreference='Continue'
+          $sd = Split-Path $CfgPath -Parent
+          $serverScript = Join-Path $sd 'rdp-redirect-server.ps1'
+          $watcherScript = Join-Path $sd 'ghrdp-watcher.ps1'
+          $okFile = Join-Path $sd 'ghrdp_server_ok.txt'
+          $progressPath = Join-Path $sd 'ghrdp_progress.json'
+          $emFlag = Join-Path $sd 'ghrdp_emergency.flag'
+          $flushFlag = Join-Path $sd 'ghrdp_flush.flag'
+          $cfg = $null; try { $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json } catch { Write-Host "[FATAL] cannot read config: $_"; Read-Host "press Enter to close"; exit 1 }
+          function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), $m) -ForegroundColor $c }
+          Write-Host ""
+          Line Cyan "============================================================"
+          Line Cyan "  MISSION CONTROL  -  RDP dashboard + mirror launcher"
+          Line Cyan "  This console IS your live diagnostic. Keep it open."
+          Line Cyan "============================================================"
+          Line White ("  RDP IP   = {0}" -f $cfg.rdpIp)
+          Line White ("  USER     = {0}" -f $cfg.rdpUser)
+          Line White ("  MIRROR   = {0}" -f $cfg.mirror)
+          Line White ("  DASHBOARD= http://127.0.0.1:{0}/" -f $Port)
+          Write-Host ""
+          if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing: $serverScript"; Read-Host "press Enter to close"; exit 1 }
+          Remove-Item $okFile -Force -EA 0
+          # 1) start mirror watcher (background job) if mirror ON
+          $wjob=$null
+          if($cfg.mirror -and (Test-Path $watcherScript)){
+            try { $wjob = Start-Job -FilePath $watcherScript -ArgumentList $CfgPath; Line Green ("[watcher] started job id={0}" -f $wjob.Id) }
+            catch { Line Red ("[watcher] Start-Job FAILED: {0}" -f $_) }
+          } elseif($cfg.mirror){ Line Red "[watcher] watcher script missing: $watcherScript" }
+          else { Line Yellow "[watcher] mirror OFF - no watcher needed" }
+          # 2) start dashboard server (background job) - dot-source server file INSIDE the job
+          $sjob=$null
+          try {
+            $sjob = Start-Job -ScriptBlock {
+              param($ss,$port,$uidir,$prog,$cfgp,$em,$fl,$ok)
+              $ErrorActionPreference='Continue'
+              try { . $ss; Start-GhrdpServer -Port $port -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }
+              catch { Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii }
+            } -ArgumentList $serverScript,$Port,$sd,$progressPath,$CfgPath,$emFlag,$flushFlag,$okFile
+            Line Green ("[server] started job id={0}" -f $sjob.Id)
+          } catch { Line Red ("[server] Start-Job FAILED: {0}" -f $_) }
+          # 3) wait for the listener to come up (read okFile), max 15s
+          $up=$false
+          for($i=0;$i -lt 30;$i++){
+            if(Test-Path $okFile){ $txt=(Get-Content $okFile -Raw).Trim(); if($txt -match 'LISTENING'){ $up=$true; Line Green ("[server] {0}" -f $txt); break } else { Line Red ("[server] {0}" -f $txt); break } }
+            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] job died early: {0}" -f (Receive-Job $sjob -EA 0)); break }
+            Start-Sleep -Milliseconds 500
+          }
+          if(-not $up){ Line Red "[server] did NOT start listening on $Port - see messages above. Browser will show CONNECTION REFUSED." }
+          # 4) open the browser (only meaningful if server is up, but open anyway so you see the page or the error)
+          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab" } catch { Line Red ("[browser] open failed: {0}" -f $_) } }
+          # 5) OBSERVABLE status loop - prints every 2s, surfaces job deaths + errors
+          Line Cyan "------------------------------------------------------------"
+          Line Cyan "  LIVE STATUS (this window stays open = server stays alive)"
+          Line Cyan "  Close this window to stop the dashboard + watcher."
+          Line Cyan "------------------------------------------------------------"
+          while($true){
+            $sAlive = ($sjob -and $sjob.State -eq 'Running')
+            $wAlive = ($wjob -and $wjob.State -eq 'Running')
+            $listen = (Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')
+            $done=0;$act=0;$fail=0;$trk=0;$pct=0
+            if(Test-Path $progressPath){ try { $p=Get-Content $progressPath -Raw|ConvertFrom-Json -EA 0; if($p -and $p.agg){ $done=$p.agg.done;$act=$p.agg.active;$fail=$p.agg.failed;$trk=$p.agg.tracked;$pct=$p.agg.overallPct } } catch {} }
+            $col = if($listen){ 'Green' } else { 'Red' }
+            Line $col ("server={0} listen={1} watcher={2} | done={3} active={4} fail={5} tracked={6} overall={7}%" -f $sAlive,$listen,$wAlive,$done,$act,$fail,$trk,$pct)
+            if($sjob -and $sjob.State -ne 'Running'){ $msg=Receive-Job $sjob -EA 0; Line Red ("[server] JOB NOT RUNNING (state={0}): {1}" -f $sjob.State,$msg) }
+            if($wjob -and $wjob.State -ne 'Running'){ $msg=Receive-Job $wjob -EA 0; Line Red ("[watcher] JOB NOT RUNNING (state={0}): {1}" -f $wjob.State,$msg) }
+            Start-Sleep -Seconds 2
+          }
+          EOF
+
       - name: Write summary helper (creds to log + Summary)
         shell: bash
         run: |
@@ -512,18 +580,19 @@ jobs:
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  DASHBOARD = open INSIDE the RDP desktop: http://127.0.0.1:7331/"
-          Write-Host "  (NOT from your local PC. Live while Keep Alive runs.)"
+          Write-Host "  After RDP login: DOUBLE-CLICK desktop icon 'Mission Control'"
+          Write-Host "  -> a console window prints live status + opens the dashboard"
+          Write-Host "     at http://127.0.0.1:7331/ (inside the RDP desktop only)."
           Write-Host "  Manual RDP from your PC (Tailscale ON): mstsc -> $ip"
           Write-Host "============================================================"
           "### RDP Credentials" >> $S
           "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
-          "**Dashboard (open INSIDE the RDP desktop):** http://127.0.0.1:7331/  |  **Manual RDP:** mstsc -> ``$ip`` (your PC needs Tailscale ON)" >> $S
-          "_GitHub keeps the Summary tab blank while the job runs and won't expand running steps. Read creds from the finished 'Show RDP credentials' step; open the dashboard from inside RDP._" >> $S
-          if($cfg.mirror){ "Mirror ON: inside the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
+          "**After RDP login, double-click the desktop icon 'Mission Control'** -> it opens the dashboard at http://127.0.0.1:7331/ AND a live console (your diagnostic).  |  **Manual RDP:** mstsc -> ``$ip`` (your PC needs Tailscale ON)" >> $S
+          "_GitHub keeps the Summary tab blank while the job runs and won't expand running steps. Read creds from the finished 'Show RDP credentials' step._" >> $S
+          if($cfg.mirror){ "Mirror ON: in the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
           EOF
 
-      - name: Configure theme + bookmarks + apps (qBittorrent, Parsec, Edge ext)
+      - name: Configure theme + bookmarks + apps + Mission Control shortcut
         run: |
           $ErrorActionPreference = 'Continue'
           function Reset-Exit { $script:LASTEXITCODE = 0 }
@@ -554,8 +623,18 @@ jobs:
           "app_host = 1`r`nprivacy_mode = 0`r`nserver_resolution = 1920x1080" | Set-Content (Join-Path $pcfg 'config.txt') -Encoding ASCII -ErrorAction SilentlyContinue
           if(Test-Path 'C:\Program Files\Parsec\parsecd.exe'){ New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'ParsecAuto' -Value '"C:\Program Files\Parsec\parsecd.exe"' -PropertyType String -Force -ErrorAction SilentlyContinue|Out-Null; Write-Host "Parsec autolaunch set." } else { Write-Host "Parsec exe not found - skipped autolaunch." }
           Reset-Exit
-          "### Theme + Bookmarks + qBittorrent + Parsec Ready" >> $env:GITHUB_STEP_SUMMARY
-          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. Exact purple-glow wallpaper: in RDP Settings > Personalization click the glow tile (1 click). qBittorrent save path -> set to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
+          # ---- Mission Control desktop shortcut (the observable launcher) ----
+          $sd=$env:RUNNER_TEMP
+          $cfgPath=Join-Path $sd 'ghrdp_cfg.json'
+          $launcher=Join-Path $sd 'ghrdp-launcher.ps1'
+          $ps="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+          $args = "-NoExit -ExecutionPolicy Bypass -File `"$launcher`" -CfgPath `"$cfgPath`" -Port 7331"
+          foreach($desk in @("C:\Users\Public\Desktop","C:\Users\$($env:RDP_USER)\Desktop")){
+            try { New-Item -ItemType Directory -Path $desk -Force -EA 0 | Out-Null; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut((Join-Path $desk 'Mission Control.lnk')); $sc.TargetPath=$ps; $sc.Arguments=$args; $sc.WindowStyle=1; $sc.Description='Start RDP dashboard + mirror (live console)'; $sc.Save(); Write-Host "Mission Control shortcut -> $desk" } catch { Write-Host "shortcut err $desk : $_" }
+          }
+          & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
+          "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control Ready" >> $env:GITHUB_STEP_SUMMARY
+          "Machine-wide dark mode + magenta accent. Bookmarks set. qBittorrent + Parsec installed. **After RDP login, double-click the desktop icon 'Mission Control'** - it opens the dashboard + a live console that prints status/errors every 2s. Exact purple-glow wallpaper: in RDP Settings > Personalization click the glow tile (1 click). qBittorrent save path -> set to D:\RDP-Storage once. Parsec: finish email+OTP login inside RDP." >> $env:GITHUB_STEP_SUMMARY
           Write-Host "Configure step complete (no profile touched, exit forced 0)."
           exit 0
 
@@ -579,22 +658,22 @@ jobs:
           } else {
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          Write-Host "Config written. mirror=$mirrorOn. Server+watcher start in Keep Alive step."
+          Write-Host "Config written. mirror=$mirrorOn. Dashboard is launched by the Mission Control icon inside RDP."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
       # =====================================================================
-      #  KEEP ALIVE hosts the dashboard (foreground) + watcher (job) for 5h30.
-      #  The server function is dot-sourced from the file written earlier
-      #  (NO separate keepalive script file -> no ordering bug).
+      #  KEEP ALIVE = simple sleep only. NO server hosting here (that was the
+      #  fragile/unobservable part). The dashboard + watcher run inside YOUR
+      #  RDP session, started by the Mission Control icon you double-click.
       # =====================================================================
-      - name: Keep Alive (5h30) - hosts dashboard + watcher
+      - name: Keep Alive (5h30)
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
-          . (Join-Path $sd 'rdp-redirect-server.ps1')
-          Write-Host "Starting dashboard server (foreground) + watcher (job) for 330 minutes..."
-          Start-GhrdpServer -Port 7331 -UiDir $sd -ProgressPath (Join-Path $sd 'ghrdp_progress.json') -CfgPath (Join-Path $sd 'ghrdp_cfg.json') -EmergencyFlagPath (Join-Path $sd 'ghrdp_emergency.flag') -FlushFlagPath (Join-Path $sd 'ghrdp_flush.flag') -LimitMinutes 330 -FlushAtMinutes 270 -WatcherScript (Join-Path $sd 'ghrdp-watcher.ps1')
-          Write-Host "Keep Alive host finished (session window closed)."
+          $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
+          Write-Host "Session alive for 5h30. Open the dashboard from INSIDE RDP via the Mission Control icon."
+          while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
+          Write-Host "5h30 done."
 
       - name: Emergency upload on cancel (always)
         if: ${{ always() && github.event.inputs.mirror_downloads_public == 'true' }}
