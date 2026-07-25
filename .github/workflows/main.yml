@@ -83,7 +83,6 @@ jobs:
           Set-ItemProperty -Path "$rdp\WinStations\RDP-Tcp" -Name "MinEncryptionLevel" -Value 3
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Direction Inbound -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
-          # dashboard port: maximally permissive on the VM (only reachable path is Tailscale/Funnel anyway)
           Remove-NetFirewallRule -DisplayName 'ghrdp-dash' -ErrorAction SilentlyContinue
           New-NetFirewallRule -DisplayName 'ghrdp-dash' -Direction Inbound -LocalPort 7331 -Protocol TCP -Action Allow -Profile Any -Enabled True -ErrorAction SilentlyContinue | Out-Null
           & netsh.exe advfirewall firewall add rule name="ghrdp-dash-netsh" dir=in action=allow protocol=TCP localport=7331 enable=yes | Out-Null; $LASTEXITCODE=0
@@ -112,14 +111,12 @@ jobs:
           $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
           $user = $env:RDP_USER; $pass = $env:RDP_PASS
           Write-Host "============================================================"
-          Write-Host "  RDP CREDENTIALS  (this step is FINISHED -> expandable now)"
-          Write-Host "  IP   = $ip   USER = $user   PASS = $pass"
-          Write-Host "------------------------------------------------------------"
-          Write-Host "  LOCAL PC DASHBOARD = the FUNNEL link printed by the"
-          Write-Host "  'Mission Control' console inside RDP (copy it there)."
-          Write-Host "  It looks like:  https://<runner>.<tail>.ts.net/?key=...."
-          Write-Host "  (127.0.0.1 on your pc = your own pc -> never works here.)"
-          Write-Host "  INSIDE RDP: double-click desktop icon 'Mission Control'."
+          Write-Host "  RDP CREDENTIALS  IP=$ip  USER=$user  PASS=$pass"
+          Write-Host "  AUTO-CONNECT: click the ONE-CLICK RDP link in the Summary"
+          Write-Host "  tab (it opens the dashboard on your pc, which auto-fires"
+          Write-Host "  the ghrdp handler -> RDP connects with NO typing)."
+          Write-Host "  First time the browser asks 'Open app?' -> tick ALWAYS"
+          Write-Host "  ALLOW + Open. After that: zero typing forever."
           Write-Host "============================================================"
 
       - name: Write mirror lib (shared functions)
@@ -229,7 +226,7 @@ jobs:
               tailscaleIp = $tsip; selfConnectFromVmViaTailscaleIp = $selfConnect; selfConnectError = $selfErr
               funnelUrl = $(if($cfg.funnelUrl){$cfg.funnelUrl}else{'(funnel not enabled - see Mission Control console)'})
               requestCameViaLoopback = $loopback; requestHost = $parsed.headers['host']
-              note = "Direct Tailscale-IP access from a local pc is blocked by GitHub runner network policy. Use the FUNNEL url (token-gated) for local-pc access; use 127.0.0.1 only inside RDP."
+              note = "Direct Tailscale-IP access from a local pc is blocked by GitHub runner network policy. Use the FUNNEL url (token-gated) for local-pc access; the dashboard then AUTO-FIRES the ghrdp handler for zero-typing RDP."
             }
           }
           function HandleOne($client){
@@ -239,7 +236,7 @@ jobs:
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
               $loop = IsLoopbackHost $parsed
               $keyOk = $loop -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
-              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - missing or bad ?key=. Open the FUNNEL link copied from the Mission Control console inside RDP (it includes ?key=...)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
+              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - missing or bad ?key=. Use the ONE-CLICK RDP link in the GitHub Summary tab (it carries the key)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
               if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
               elseif($path -eq '/diag'){ $d = BuildDiag $cfg $parsed; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress))) }
               elseif($path -eq '/progress' -or $path -eq '/app.js'){
@@ -262,7 +259,7 @@ jobs:
           }
           EOF
 
-      - name: Write dashboard UI (mode badge + local-pc funnel link + tracker + creds)
+      - name: Write dashboard UI (AUTO-FIRES ghrdp on local pc = zero-typing RDP)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-ui.html" <<'UIEOF'
@@ -304,6 +301,13 @@ jobs:
           .diagbtn{ font-family:var(--mono); font-size:11px; letter-spacing:.06em; background:#16202a; color:var(--amber); border:1px solid #5a4414; border-radius:8px; padding:6px 10px; cursor:pointer; transition:background .15s ease; }
           .diagbtn:hover{ background:#241c0c; }
           @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(55,198,176,.55)} 70%{box-shadow:0 0 0 9px rgba(55,198,176,0)} 100%{box-shadow:0 0 0 0 rgba(55,198,176,0)} }
+          .autobox{ margin:0 0 18px; padding:18px; border-radius:16px; border:1px solid #33305a; background:linear-gradient(180deg,#13111f,#0d0b16); text-align:center; }
+          .autobox .big{ font-family:var(--disp); font-weight:700; font-size:18px; color:#cfc7ff; margin-bottom:6px; }
+          .autobox .spin{ display:inline-block; width:14px; height:14px; border:2px solid #4a4470; border-top-color:var(--violet); border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:-2px; margin-right:8px; }
+          @keyframes spin{ to{ transform:rotate(360deg) } }
+          .autobox .sub{ font-family:var(--mono); font-size:11px; color:var(--mut); line-height:1.6; margin-top:8px; }
+          .autobox .manual{ display:inline-block; margin-top:14px; font-family:var(--disp); font-weight:700; letter-spacing:.04em; text-transform:uppercase; background:linear-gradient(180deg,#8b7bf0,#6a5ad0); color:#fff; border:0; border-radius:12px; padding:13px 26px; font-size:14px; cursor:pointer; text-decoration:none; box-shadow:0 10px 26px rgba(139,123,240,.3); }
+          .autobox .manual:hover{ filter:brightness(1.08); }
           .grid{ display:grid; grid-template-columns:1.45fr 1fr; gap:16px; }
           .panel{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line); border-radius:16px; padding:20px; position:relative; overflow:hidden; transition:border-color .2s ease; }
           .panel:hover{ border-color:#2c3b46; }
@@ -363,12 +367,6 @@ jobs:
           .cp{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;background:#16202a;color:var(--teal);border:1px solid var(--teal-d);border-radius:8px;padding:7px 4px;cursor:pointer; transition:background .15s ease;}
           .cp:hover{background:var(--teal-d)}
           .cp.done{color:var(--green);border-color:#1f6f43}
-          .localurl{ margin-top:12px; padding:11px; border-radius:10px; background:#0c0b18; border:1px dashed #3a3568; font-family:var(--mono); font-size:11.5px; color:#cfc7ff; }
-          .localurl .hd{ color:var(--violet); font-weight:700; letter-spacing:.04em; }
-          .localurl a{ color:#bdb2ff; word-break:break-all; }
-          .localurl .row{ display:flex; gap:8px; align-items:center; margin-top:7px; }
-          .localurl .row code{ flex:1; background:#070b0e; border:1px solid #2a2750; border-radius:8px; padding:7px 9px; color:#e9eef3; word-break:break-all; font-size:11px; }
-          .localurl .note{ margin-top:8px; color:var(--mut); font-size:10.5px; line-height:1.5; }
           #diagBox{ display:none; margin-top:12px; }
           #diagBox pre{ font-family:var(--mono); font-size:11px; line-height:1.6; background:#070b0e; border:1px solid var(--line); border-radius:10px; padding:12px; max-height:360px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#cfe9e4; }
           .ok{ color:var(--green); } .bad{ color:var(--red); }
@@ -387,6 +385,13 @@ jobs:
                 <span id="alive" class="pill"><span class="d"></span><span id="alivetxt">checking</span></span>
               </div>
             </header>
+
+            <div class="autobox" id="autoBox" style="display:none">
+              <div class="big"><span class="spin" id="autoSpin"></span><span id="autoTitle">Connecting you to RDP…</span></div>
+              <div class="sub" id="autoSub">Firing your local RDP handler (zero typing). If your browser shows an “Open app?” prompt, tick <b>Always allow</b> + Open — after that it is fully automatic.</div>
+              <a class="manual" id="autoManual" href="#">⚡ Open RDP now (if it didn’t auto-open)</a>
+            </div>
+
             <div class="grid">
               <div class="stack">
                 <div class="panel hero">
@@ -408,15 +413,10 @@ jobs:
               </div>
               <div class="stack">
                 <div class="panel creds">
-                  <div class="lbl" style="margin-bottom:12px">RDP credentials <span style="color:var(--mut);text-transform:none;letter-spacing:0">(click copy)</span></div>
+                  <div class="lbl" style="margin-bottom:12px">RDP credentials <span style="color:var(--mut);text-transform:none;letter-spacing:0">(auto-filled by handler)</span></div>
                   <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
-                  <div class="localurl" id="localUrlBox">
-                    <div class="hd">🔗 OPEN ON YOUR LOCAL PC</div>
-                    <div class="row"><code id="funnelCode">-</code><button class="cp" id="funnelCopy" type="button">copy</button></div>
-                    <div class="note">This <b>Funnel</b> link (token‑gated) is the ONLY way a local‑pc browser can reach the runner — GitHub blocks direct Tailscale‑IP access to custom ports. Copy it from here (inside RDP) and paste it on your pc. If it shows “(funnel not enabled)”, read the Mission Control console for the reason.</div>
-                  </div>
                   <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
                 </div>
                 <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
@@ -453,6 +453,7 @@ jobs:
           <script>
           (function(){
             var D={pct:0,bDone:0};
+            var ghrdpUrl=null; var autoFired=false;
             function fb(b){ b=+b||0; if(b<1024)return b+' B'; if(b<1048576)return (b/1024).toFixed(1)+' KB'; if(b<1073741824)return (b/1048576).toFixed(1)+' MB'; return (b/1073741824).toFixed(2)+' GB'; }
             function fs(b){ b=+b||0; return fb(b)+'/s'; }
             function fe(remB,sp){ sp=+sp||0; if(sp<=0||remB<=0)return '—'; var s=remB/sp; if(s<60)return Math.round(s)+'s'; if(s<3600)return Math.round(s/60)+'m'; return (s/3600).toFixed(1)+'h'; }
@@ -466,9 +467,17 @@ jobs:
             function copyBtn(btn,val){ function ok(){ btn.textContent='copied'; btn.classList.add('done'); setTimeout(function(){btn.textContent='copy';btn.classList.remove('done');},1200); } if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(val).then(ok).catch(function(){ fallbackCopy(val); ok(); }); } else { fallbackCopy(val); ok(); } }
             function setCreds(c){ if(!c)return; var map={ip:c.ip,user:c.user,pass:c.pass}; ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(!row)return; row.dataset.val=map[k]||''; var code=row.querySelector('code'); if(code)code.textContent=map[k]||'-'; }); }
             document.querySelectorAll('.crow .cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); copyBtn(b, row?row.dataset.val:''); }); });
-            document.getElementById('funnelCopy').addEventListener('click',function(){ var c=document.getElementById('funnelCode'); copyBtn(this, c?c.textContent:''); });
-            function setMode(loop){ var m=document.getElementById('mode'); if(loop){ m.className='mode loop'; m.textContent='◉ RDP / loopback'; } else { m.className='mode funnel'; m.textContent='⬈ FUNNEL (local pc)'; } }
-            function setFunnel(u){ var c=document.getElementById('funnelCode'); c.textContent = u || '(funnel not enabled - see console)'; }
+            function setMode(loop){ var m=document.getElementById('mode'); if(loop){ m.className='mode loop'; m.textContent='◉ RDP / loopback'; } else { m.className='mode funnel'; m.textContent='⬈ LOCAL PC (auto-connect)'; } }
+            function fireAutoConnect(url){
+              if(!url || autoFired) return;
+              autoFired=true;
+              var box=document.getElementById('autoBox'); box.style.display='block';
+              document.getElementById('autoManual').href=url;
+              // try an invisible iframe first (some browsers fire the protocol handler without leaving the page)
+              try { var ifr=document.createElement('iframe'); ifr.style.display='none'; ifr.src=url; document.body.appendChild(ifr); } catch(e){}
+              // also a direct location assign as fallback
+              setTimeout(function(){ try{ window.location.href=url; }catch(e){} }, 300);
+            }
             function yn(v){ return v? '<span class="ok">PASS</span>' : '<span class="bad">FAIL</span>'; }
             document.getElementById('diagBtn').addEventListener('click',function(){
               var box=document.getElementById('diagBox'); var out=document.getElementById('diagOut');
@@ -479,15 +488,16 @@ jobs:
                 L.push('bind 0.0.0.0            : '+yn(d.bindOk));
                 L.push('port 7331 listening     : '+yn(d.portListening));
                 L.push('firewall rule present   : '+yn(d.firewallRulePresent));
-                L.push('tailscale ip (from cfg) : '+(d.tailscaleIp||'(none)'));
-                L.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+(d.selfConnectError?('  '+d.selfConnectError):'  (often FAIL = GitHub blocks it -> use Funnel)'));
+                L.push('tailscale ip            : '+(d.tailscaleIp||'(none)'));
+                L.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+'  (FAIL here is EXPECTED -> GitHub blocks it; Funnel+handler is the path)');
                 L.push('funnel url              : '+(d.funnelUrl||'(not enabled)'));
                 L.push('this request via loopbk : '+yn(d.requestCameViaLoopback)+'   host='+d.requestHost);
                 L.push('');
-                L.push('== VERDICT ==');
-                L.push('Direct http://<tailscale-ip>:7331 from a local pc = blocked by GitHub (expected).');
-                L.push('Local pc MUST use the FUNNEL url (token-gated) shown in the panel above.');
-                L.push('Inside RDP, 127.0.0.1:7331 works (loopback).');
+                L.push('== HOW ZERO-TYPING RDP WORKS ==');
+                L.push('On your LOCAL pc this page auto-fires ghrdp:// -> your installed handler');
+                L.push('runs cmdkey (saves password) + mstsc -> RDP opens with NO typing.');
+                L.push('First time: browser asks "Open app?" -> tick ALWAYS ALLOW + Open.');
+                L.push('If auto did not fire: click the purple "Open RDP now" button at the top.');
                 L.push('');
                 L.push('raw: '+JSON.stringify(d,null,1));
                 out.innerHTML=L.join('\n');
@@ -500,10 +510,12 @@ jobs:
               if(!s.mirror){ on=true; txt='rdp ready'; }
               else { on = s.alive && age<15; txt = on? 'online' : (s.alive? 'stale '+Math.round(age)+'s':'offline'); }
               var al=document.getElementById('alive'); al.className='pill'+(on?' on':''); document.getElementById('alivetxt').textContent=txt;
-              if(s.ghrdp){ document.getElementById('rdp').href=s.ghrdp; }
+              if(s.ghrdp){ ghrdpUrl=s.ghrdp; document.getElementById('rdp').href=s.ghrdp; document.getElementById('autoManual').href=s.ghrdp; }
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
-              setCreds(s.creds); setFunnel(s.funnelUrl); setMode(!!s.viaLoopback);
+              setCreds(s.creds); setMode(!!s.viaLoopback);
+              // AUTO-CONNECT only when viewed from the LOCAL pc (Funnel), never from inside RDP loopback
+              if(s.ghrdp && !s.viaLoopback){ fireAutoConnect(s.ghrdp); }
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
               document.getElementById('bTotal').textContent=fb(a.bytesTotal); document.getElementById('speed').textContent=fs(a.speedBps);
               document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
@@ -578,7 +590,7 @@ jobs:
             Start-Sleep -Seconds 3 }
           EOF
 
-      - name: Write Mission Control launcher (starts server + enables FUNNEL + prints local-pc link)
+      - name: Write Mission Control launcher (starts server + enables FUNNEL)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
@@ -599,14 +611,11 @@ jobs:
           Write-Host ""
           Line Cyan "============================================================"
           Line Cyan "  MISSION CONTROL  -  dashboard + mirror + FUNNEL"
-          Line Cyan "  This console IS your live diagnostic. Keep it open."
           Line Cyan "============================================================"
-          Line White ("  RDP / Tailscale IP = {0}" -f $tsip)
-          Line White ("  USER               = {0}" -f $cfg.rdpUser)
-          Line White ("  MIRROR             = {0}" -f $cfg.mirror)
+          Line White ("  RDP / Tailscale IP = {0}   USER = {1}   MIRROR = {2}" -f $tsip,$cfg.rdpUser,$cfg.mirror)
           Line White ("  INSIDE RDP         -> http://127.0.0.1:{0}/" -f $Port)
           Write-Host ""
-          if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing: $serverScript"; Read-Host "press Enter to close"; exit 1 }
+          if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing"; Read-Host "press Enter to close"; exit 1 }
           Remove-Item $okFile -Force -EA 0
           $wjob=$null
           if($cfg.mirror -and (Test-Path $watcherScript)){
@@ -630,19 +639,17 @@ jobs:
             if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] job died: {0}" -f (Receive-Job $sjob -EA 0)); break }
             Start-Sleep -Milliseconds 500
           }
-          if(-not $up){ Line Red "[server] did NOT start - see above." }
-          # ---- enable Tailscale FUNNEL (the only local-pc-reachable path) ----
+          if(-not $up){ Line Red "[server] did NOT start." }
           $funnelUrl=''
           if($up){
             try {
               & $ts funnel --bg $Port on 2>&1 | ForEach-Object { Line DarkGray ("[funnel] {0}" -f $_) }
-              $LASTEXITCODE=0
-              Start-Sleep -Seconds 3
+              $LASTEXITCODE=0; Start-Sleep -Seconds 3
               $stj = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop
               $dns = $stj.Self.DNSName
               if($dns){ $dns=$dns.TrimEnd('.'); $funnelUrl = ("https://{0}/?key={1}" -f $dns,$cfg.dashToken); Line Green ("[funnel] ENABLED -> {0}" -f $funnelUrl) }
               else { Line Yellow "[funnel] enabled but DNS name not found in status" }
-            } catch { Line Red ("[funnel] enable FAILED: {0}  (tailnet may block Funnel; use RDP-internal dashboard + rentry tracker)" -f $_) }
+            } catch { Line Red ("[funnel] enable FAILED: {0}" -f $_) }
             $cfg.funnelUrl = $funnelUrl; SaveCfg $cfg
           }
           $loopOk=$false; try { Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/" -f $Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $loopOk=$true } catch {}
@@ -650,12 +657,13 @@ jobs:
           if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" } catch {} }
           Write-Host ""
           Line Cyan "============================================================"
-          Line Cyan "  >>> COPY THIS ONTO YOUR LOCAL PC BROWSER <<<"
-          if($funnelUrl){ Line Green ("  {0}" -f $funnelUrl) } else { Line Red "  (Funnel unavailable - open http://127.0.0.1:7331/ inside RDP instead)" }
+          Line Cyan "  ONE-CLICK RDP LINK (paste on your LOCAL pc, or use the"
+          Line Cyan "  clickable link in the GitHub Summary tab):"
+          if($funnelUrl){ Line Green ("  {0}" -f $funnelUrl) } else { Line Red "  (Funnel unavailable - use RDP-internal dashboard)" }
+          Line Cyan "  Opening it on your pc AUTO-FIRES RDP (zero typing)."
           Line Cyan "============================================================"
           Write-Host ""
           Line Cyan "  LIVE STATUS (window open = alive; close = stop)"
-          Line Cyan "------------------------------------------------------------"
           while($true){
             $sAlive = ($sjob -and $sjob.State -eq 'Running')
             $wAlive = ($wjob -and $wjob.State -eq 'Running')
@@ -670,7 +678,7 @@ jobs:
           }
           EOF
 
-      - name: Write summary helper (creds to log + Summary)
+      - name: Write summary helper (ONE-CLICK RDP link clickable in Summary)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-summary.ps1" <<'EOF'
@@ -678,18 +686,26 @@ jobs:
           $ErrorActionPreference='SilentlyContinue'
           if(-not (Test-Path $CfgPath)){ return }
           $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
-          $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp
+          $ip=$cfg.rdpIp; $user=$cfg.rdpUser; $pass=$cfg.rdpPass; $ghrdp=$cfg.ghrdp; $funnel=$cfg.funnelUrl
           $S = $env:GITHUB_STEP_SUMMARY
           Write-Host "============================================================"
           Write-Host "  RDP READY  IP=$ip  USER=$user  PASS=$pass"
-          Write-Host "  LOCAL PC DASHBOARD = FUNNEL link in the Mission Control"
-          Write-Host "  console inside RDP (https://<runner>.<tail>.ts.net/?key=..)"
-          Write-Host "  INSIDE RDP: double-click desktop icon 'Mission Control'."
-          Write-Host "  (direct http://$ip`:7331 from local pc is blocked by GitHub)"
+          if($funnel){ Write-Host "  ONE-CLICK RDP (click on your pc): $funnel" }
           Write-Host "============================================================"
-          "### RDP Credentials" >> $S
+          "### 🚀 ONE-CLICK RDP (no typing - click on YOUR pc)" >> $S
+          if($funnel){
+            "" >> $S
+            "👉 **[$funnel]($funnel)**" >> $S
+            "" >> $S
+            "Click the link above **on your local pc**. It opens the dashboard, which **auto-fires your RDP handler** -> RDP connects with the password already filled (zero typing). The **first time** your browser asks *“Open app?”* -> tick **Always allow** + **Open**; after that it is fully automatic." >> $S
+            "" >> $S
+            "_If the auto-open does not trigger, the same page shows a purple **Open RDP now** button._" >> $S
+          } else {
+            "_Funnel link not ready yet - open the Mission Control console inside RDP and copy the ONE-CLICK link from there, or wait and refresh the Summary._" >> $S
+          }
+          "" >> $S
+          "### RDP Credentials (for reference / manual mstsc)" >> $S
           "**IP:** ``$ip``  **User:** ``$user``  **Pass:** ``$pass``" >> $S
-          "**Local‑pc dashboard = the FUNNEL link** printed by the **Mission Control** console inside RDP (copy it there; it is token‑gated). Direct ``http://$ip`:7331`` from a local pc is blocked by GitHub runner network policy. Inside RDP: double‑click **Mission Control**. Stuck? click **DIAGNOSE** on the dashboard." >> $S
           if($cfg.mirror){ "Mirror ON: in the dashboard click **UPLOAD EVERYTHING NOW** -> wait for green banner -> THEN Cancel. Index: $($cfg.rentryUrl)" >> $S }
           EOF
 
@@ -733,8 +749,8 @@ jobs:
             try { New-Item -ItemType Directory -Path $desk -Force -EA 0 | Out-Null; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut((Join-Path $desk 'Mission Control.lnk')); $sc.TargetPath=$ps; $sc.Arguments=$args; $sc.WindowStyle=1; $sc.Description='Start RDP dashboard + mirror + Funnel (live console)'; $sc.Save(); Write-Host "Mission Control shortcut -> $desk" } catch { Write-Host "shortcut err $desk : $_" }
           }
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
-          "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control + Funnel Ready" >> $env:GITHUB_STEP_SUMMARY
-          "Dark mode + magenta accent, bookmarks, qBittorrent, Parsec installed. **Local‑pc dashboard = the FUNNEL link in the Mission Control console (token‑gated).** Inside RDP double‑click **Mission Control**; the dashboard shows a copy‑able Funnel link + a **DIAGNOSE** deep self‑test. Direct Tailscale‑IP access from a local pc is blocked by GitHub (expected)." >> $env:GITHUB_STEP_SUMMARY
+          "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control + Funnel + ONE-CLICK RDP Ready" >> $env:GITHUB_STEP_SUMMARY
+          "Dark mode, bookmarks, qBittorrent, Parsec installed. **ONE-CLICK RDP link is in the Summary tab** - click it on your pc and RDP auto-connects with zero typing (first time tick 'Always allow' on the browser prompt)." >> $env:GITHUB_STEP_SUMMARY
           Write-Host "Configure step complete (exit forced 0)."
           exit 0
 
@@ -759,7 +775,7 @@ jobs:
           } else {
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; dashToken=$dashToken; funnelUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
-          Write-Host "Config written. mirror=$mirrorOn. dashToken set. Funnel enabled by Mission Control launcher."
+          Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
       - name: Keep Alive (5h30)
@@ -767,7 +783,7 @@ jobs:
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          Write-Host "Session alive 5h30. Local pc = Funnel link from Mission Control console. Inside RDP = Mission Control icon."
+          Write-Host "Session alive 5h30. ONE-CLICK RDP link is in the Summary tab - click it on your pc."
           while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
           Write-Host "5h30 done."
 
