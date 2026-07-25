@@ -155,6 +155,37 @@ jobs:
           }
           if(-not $acl){ Write-Host "[acl] left ACL unchanged (could not safely read it). If Funnel still fails, regenerate the token with admin rights." }
 
+      # === S1 (NEW): tailnet web link via Tailscale Serve - clickable, NO secret, fully auto ===
+      - name: Setup tailnet web link (Tailscale Serve - clickable, no secret needed)
+        run: |
+          $ts="C:\Program Files\Tailscale\tailscale.exe"
+          $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]})
+          Add-Content $env:GITHUB_ENV ("DASH_TOKEN=" + $dashToken)
+          $serveUrl=''
+          for($a=1;$a -le 3;$a++){
+            $out = & $ts serve --bg --yes 7331 2>&1
+            $out | ForEach-Object { Write-Host ("[serve] " + $_) }
+            $LASTEXITCODE=0
+            $stj=$null; try{ $stj=& $ts status --json 2>$null|ConvertFrom-Json -EA Stop }catch{}
+            $dns=if($stj){ $stj.Self.DNSName }else{ $null }
+            if($dns){ $dns=$dns.TrimEnd('.'); $serveUrl = ("https://" + $dns + "/?key=" + $dashToken); break }
+            Write-Host ("[serve] attempt " + $a + ": DNS not ready yet"); Start-Sleep -Seconds 3
+          }
+          Add-Content $env:GITHUB_ENV ("SERVE_URL=" + $serveUrl)
+          Write-Host '============================================================'
+          if($serveUrl){
+            Write-Host '  TAILNET WEB LINK (clickable - open on your LOCAL pc):'
+            Write-Host ('  SERVE_WEBAPP_LINK: ' + $serveUrl)
+            Write-Host '  https link -> clickable in this log. Opens the web-app on'
+            Write-Host '  your pc (you are in the tailnet) -> auto RDP, zero typing.'
+            Write-Host '  Live ~1 min after run starts (when Keep Alive hosts it).'
+          } else {
+            Write-Host '  SERVE failed (see [serve] lines). If HTTPS certs are OFF in'
+            Write-Host '  your tailnet DNS settings, turn them ON; else use ghrdp paste.'
+          }
+          Write-Host '============================================================'
+          "### Tailnet web-app link (click on your local pc)" >> $env:GITHUB_STEP_SUMMARY
+          if($serveUrl){ ("**[>>> OPEN RDP WEB-APP FROM YOUR PC <<<](" + $serveUrl + ")**  _(live once Keep Alive starts)_") >> $env:GITHUB_STEP_SUMMARY } else { "_Serve failed - use the ghrdp paste link in the Show RDP credentials step._" >> $env:GITHUB_STEP_SUMMARY }
       - name: Enable RDP + harden + open dashboard port (all profiles)
         run: |
           $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
@@ -188,33 +219,27 @@ jobs:
           Write-Host "Created account: $user"
 
       # === EDIT 2: Show RDP credentials - creds + clickable Funnel link + ghrdp paste + guide, ALL in this log ===
-      - name: Show RDP credentials (open THIS step for IP/user/pass + links)
+      - name: Show RDP credentials (open THIS step for IP/user/pass + clickable link)
         run: |
           $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
           $user = $env:RDP_USER; $pass = $env:RDP_PASS
           $ghrdp = "ghrdp://" + $ip + "/" + [uri]::EscapeDataString($user) + "/" + [uri]::EscapeDataString($pass)
           Add-Content $env:GITHUB_ENV ("GHRDP_NOW=" + $ghrdp)
-          $cfgPath = Join-Path $env:RUNNER_TEMP 'ghrdp_cfg.json'
-          $funnel = ''
-          if(Test-Path $cfgPath){ try { $c = Get-Content $cfgPath -Raw | ConvertFrom-Json -EA 0; if($c.funnelUrl){ $funnel = $c.funnelUrl } } catch {} }
+          $serveUrl = $env:SERVE_URL
           Write-Host '============================================================'
           Write-Host ('  RDP CREDENTIALS  IP=' + $ip + '  USER=' + $user + '  PASS=' + $pass)
           Write-Host '============================================================'
-          if($funnel){
+          if($serveUrl){
             Write-Host ''
-            Write-Host '>>> CLICKABLE HYPERLINK (ඔයාගේ PC එකේ click -> web-app -> zero-typing RDP):'
-            Write-Host ('    ' + $funnel)
-          } else {
-            Write-Host ''
-            Write-Host '>>> CLICKABLE hyperlink තාම නෑ (TS_API_KEY secret add කරලා නැති නිසා).'
-            Write-Host '>>> සම්පූර්ණ clickable-links guide එක බලන්න: "Auto-enable Funnel on tailnet" step එක expand කරන්න.'
+            Write-Host '>>> CLICKABLE WEB-APP LINK (LOCAL pc -> auto RDP, zero typing):'
+            Write-Host ('    WEBAPP_LINK: ' + $serveUrl)
+            Write-Host '    (live ~1 min after run starts, when Keep Alive hosts it)'
           }
           Write-Host ''
-          Write-Host '>>> දැන්ම RDP යන්න (ghrdp link එක LOCAL browser address bar එකේ PASTE + Enter + Open):'
+          Write-Host '>>> ZERO-TYPING now (PASTE in LOCAL browser bar + Enter + Open):'
           Write-Host ('    ' + $ghrdp)
-          Write-Host '    (ghrdp:// log එකේ clickable වෙන්නේ නෑ - GitHub rule; ඒක paste fallback. clickable link = ඉහළ https link එක.)'
           Write-Host ''
-          Write-Host '>>> Manual mstsc (reference):  mstsc -> ' + $ip + '   user ' + $user + '   pass ' + $pass
+          Write-Host ('>>> Manual mstsc: mstsc -> ' + $ip + '  user ' + $user + '  pass ' + $pass)
           Write-Host '============================================================'
 
       - name: Write mirror lib (shared functions)
@@ -516,9 +541,9 @@ jobs:
                   <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
                   <div style="margin-top:12px">
-                    <div class="lbl" style="margin-bottom:8px">One-click RDP (clickable ghrdp link - works inside this webapp)</div>
-                    <a id="ghrdpLink" href="#" style="display:block;font-family:var(--mono);font-size:11.5px;color:var(--teal);background:#070b0e;border:1px solid var(--teal-d);border-radius:9px;padding:10px 12px;word-break:break-all;text-decoration:none;transition:background .15s ease">ghrdp://…</a>
-                    <p style="font-family:var(--mono);font-size:10px;color:var(--mut);margin-top:7px;line-height:1.5">This ghrdp link is clickable HERE (inside the webapp) and on your local pc after the connector is installed. On GitHub log/Summary it cannot be a hyperlink (GitHub strips custom schemes) - that is a GitHub rule, not a bug.</p>
+                    <div class="lbl" style="margin-bottom:8px">One-click RDP (clickable ghrdp link inside this webapp)</div>
+                    <a id="ghrdpLink" href="#" style="display:block;font-family:var(--mono);font-size:11.5px;color:var(--teal);background:#070b0e;border:1px solid var(--teal-d);border-radius:9px;padding:10px 12px;word-break:break-all;text-decoration:none">ghrdp://…</a>
+                    <p style="font-family:var(--mono);font-size:10px;color:var(--mut);margin-top:7px;line-height:1.5">This ghrdp link is clickable HERE (a web page can link custom schemes; GitHub log/Summary cannot - that is a GitHub rule). On your local pc it works after the one-time connector is installed.</p>
                   </div>
                   <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
                 </div>
@@ -695,89 +720,23 @@ jobs:
           EOF
 
       # === EDIT 1: launcher - robust Funnel (works when ACL done) + passes funnel status to Summary ===
-      - name: Write Mission Control launcher (starts server + robust FUNNEL)
+      - name: Write Mission Control launcher (observe mode - server runs from Keep Alive)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
           param([string]$CfgPath,[int]$Port=7331)
-          $ErrorActionPreference='Continue'
-          $sd = Split-Path $CfgPath -Parent
-          $serverScript = Join-Path $sd 'rdp-redirect-server.ps1'
-          $watcherScript = Join-Path $sd 'ghrdp-watcher.ps1'
-          $okFile = Join-Path $sd 'ghrdp_server_ok.txt'
-          $progressPath = Join-Path $sd 'ghrdp_progress.json'
-          $emFlag = Join-Path $sd 'ghrdp_emergency.flag'
-          $flushFlag = Join-Path $sd 'ghrdp_flush.flag'
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          $cfg = $null; try { $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json } catch { Write-Host "[FATAL] cannot read config: $_"; Read-Host "press Enter to close"; exit 1 }
-          function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'), $m) -ForegroundColor $c }
-          function SaveCfg($c){ $c | ConvertTo-Json -Depth 6 | Set-Content $CfgPath -Encoding UTF8 }
-          $tsip=$cfg.rdpIp; if(-not $tsip){ try { $tsip=(& $ts ip -4 2>$null).Trim() } catch {} }
-          Write-Host ""
-          Line Cyan "============================================================"
-          Line Cyan "  MISSION CONTROL  -  dashboard + mirror + FUNNEL"
-          Line Cyan "============================================================"
-          Line White ("  Tailscale IP = {0}   USER = {1}   MIRROR = {2}" -f $tsip,$cfg.rdpUser,$cfg.mirror)
-          Write-Host ""
-          if(-not (Test-Path $serverScript)){ Line Red "[FATAL] server script missing"; Read-Host "press Enter to close"; exit 1 }
-          Remove-Item $okFile -Force -EA 0
-          $wjob=$null
-          if($cfg.mirror -and (Test-Path $watcherScript)){
-            try { $wjob = Start-Job -FilePath $watcherScript -ArgumentList $CfgPath; Line Green ("[watcher] job id={0}" -f $wjob.Id) }
-            catch { Line Red ("[watcher] FAILED: {0}" -f $_) }
-          } elseif($cfg.mirror){ Line Red "[watcher] script missing" } else { Line Yellow "[watcher] mirror OFF" }
-          $sjob=$null
-          try {
-            $sjob = Start-Job -ScriptBlock {
-              param($ss,$port,$bind,$uidir,$prog,$cfgp,$em,$fl,$ok)
-              $ErrorActionPreference='Continue'
-              try { . $ss; Start-GhrdpServer -Port $port -BindAddress $bind -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }
-              catch { Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii }
-            } -ArgumentList $serverScript,$Port,'0.0.0.0',$sd,$progressPath,$CfgPath,$emFlag,$flushFlag,$okFile
-            Line Green ("[server] job id={0} (bind 0.0.0.0)" -f $sjob.Id)
-          } catch { Line Red ("[server] FAILED: {0}" -f $_) }
-          $up=$false
-          for($i=0;$i -lt 30;$i++){
-            if(Test-Path $okFile){ $txt=(Get-Content $okFile -Raw).Trim(); if($txt -match 'LISTENING'){ $up=$true; Line Green ("[server] {0}" -f $txt); break } else { Line Red ("[server] {0}" -f $txt); break } }
-            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] died: {0}" -f (Receive-Job $sjob -EA 0)); break }
-            Start-Sleep -Milliseconds 500
-          }
-          if(-not $up){ Line Red "[server] did NOT start." }
-          # === robust Funnel enable (ACL must be ON - see ACTION 1) ===
-          $funnelUrl=''; $funnelErr=''
-          if($up){
-            for($fa=1;$fa -le 4;$fa++){
-              $ferr = & $ts funnel --yes $Port on 2>&1
-              $ferr | ForEach-Object { Line DarkGray ("[funnel] {0}" -f $_) }
-              $LASTEXITCODE=0; Start-Sleep -Seconds 4
-              $stj = $null; try { $stj = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop } catch {}
-              $dns = if($stj){ $stj.Self.DNSName } else { $null }
-              if($dns){ $dns=$dns.TrimEnd('.'); $funnelUrl = ("https://{0}/?key={1}" -f $dns,$cfg.dashToken); Line Green ("[funnel] ENABLED -> {0}" -f $funnelUrl); break }
-              $funnelErr = ("attempt {0}: {1}" -f $fa, ($ferr -join ' '))
-              Line Yellow ("[funnel] {0}" -f $funnelErr)
-              Start-Sleep -Seconds 3
-            }
-            if(-not $funnelUrl){
-              Line Red "[funnel] NOT enabled."
-              Line Red "  -> If you have NOT done ACTION 1 yet: Tailscale admin -> ACLs -> add nodeAttrs target * attr funnel -> Save -> re-run."
-              Line Red "  -> If you ALREADY did ACTION 1: the tailnet may need 'funnel' in autoApprovers, or wait 1 min and re-run."
-            }
-            $cfg.funnelUrl = $funnelUrl; $cfg.funnelErr = $funnelErr; SaveCfg $cfg
-          }
-          $loopOk=$false; try { Invoke-WebRequest -Uri ("http://127.0.0.1:{0}/" -f $Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $loopOk=$true } catch {}
-          Line $(if($loopOk){'Green'}else{'Red'}) ("[selftest] loopback 127.0.0.1:{0} = {1}" -f $Port,$loopOk)
-          if($up){ try { Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard (inside RDP)" } catch {} }
-          Write-Host ""
-          Line Cyan "  LIVE STATUS (window open = alive; close = stop)"
+          $sd=Split-Path $CfgPath -Parent
+          $progressPath=Join-Path $sd 'ghrdp_progress.json'
+          $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json
+          function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'),$m) -ForegroundColor $c }
+          Line Cyan "Mission Control (observe mode) - dashboard+watcher+serve run from the workflow; this window shows live status + opens the RDP-internal tab."
+          Line White ("RDP IP={0}  USER={1}  MIRROR={2}" -f $cfg.rdpIp,$cfg.rdpUser,$cfg.mirror)
+          try{ Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" }catch{}
           while($true){
-            $sAlive = ($sjob -and $sjob.State -eq 'Running'); $wAlive = ($wjob -and $wjob.State -eq 'Running')
-            $listen = (Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')
+            $listen=[bool](Get-NetTCPConnection -LocalPort $Port -State Listen -EA 0)
             $done=0;$act=0;$fail=0;$trk=0;$pct=0
-            if(Test-Path $progressPath){ try { $p=Get-Content $progressPath -Raw|ConvertFrom-Json -EA 0; if($p -and $p.agg){ $done=$p.agg.done;$act=$p.agg.active;$fail=$p.agg.failed;$trk=$p.agg.tracked;$pct=$p.agg.overallPct } } catch {} }
-            $col = if($listen){ 'Green' } else { 'Red' }
-            Line $col ("server={0} listen={1} watcher={2} funnel={3} | done={4} active={5} fail={6} tracked={7} overall={8}%" -f $sAlive,$listen,$wAlive,[bool]$funnelUrl,$done,$act,$fail,$trk,$pct)
-            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] NOT RUNNING: {0}" -f (Receive-Job $sjob -EA 0)) }
-            if($wjob -and $wjob.State -ne 'Running'){ Line Red ("[watcher] NOT RUNNING: {0}" -f (Receive-Job $wjob -EA 0)) }
+            if(Test-Path $progressPath){ try{ $p=Get-Content $progressPath -Raw|ConvertFrom-Json -EA 0; if($p -and $p.agg){$done=$p.agg.done;$act=$p.agg.active;$fail=$p.agg.failed;$trk=$p.agg.tracked;$pct=$p.agg.overallPct} }catch{} }
+            Line $(if($listen){'Green'}else{'Red'}) ("listen={0} | done={1} active={2} fail={3} tracked={4} overall={5}%" -f $listen,$done,$act,$fail,$trk,$pct)
             Start-Sleep -Seconds 2
           }
           EOF
@@ -958,28 +917,42 @@ jobs:
           $indexPath=Join-Path $sd 'ghrdp_mirror_index.json'; $progressPath=Join-Path $sd 'ghrdp_progress.json'
           $hbPath=Join-Path $sd 'ghrdp_heartbeat.txt'; $emPath=Join-Path $sd 'ghrdp_emergency.flag'; $cfPath=Join-Path $sd 'ghrdp_cancel.flag'; $adPath=Join-Path $sd 'ghrdp_alldone.flag'
           $cfgPath=Join-Path $sd 'ghrdp_cfg.json'; $mirrorOn=($env:MIRROR -eq 'true')
-          $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]})
+          $dashToken = $env:DASH_TOKEN
+          if(-not $dashToken){ $rng=[System.Security.Cryptography.RandomNumberGenerator]::Create(); $alpha='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; $b=[byte[]]::new(24); $rng.GetBytes($b); $dashToken=-join ($b|%{$alpha[[int]$_ % $alpha.Length]}) }
+          $serveUrl = $env:SERVE_URL
           if($mirrorOn){
             $b2=[byte[]]::new(20); $rng.GetBytes($b2); $decPw=-join ($b2|%{$alpha[[int]$_ % $alpha.Length]})
             $dlDir="C:\Users\$user\Downloads"; $tempDir="C:\Users\$user\AppData\Local\Temp"
             $roots=@(@{path=$dlDir;rec=$false;min=0;tag='Downloads'},@{path=$tempDir;rec=$true;min=102400;tag='Temp'})
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
-            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; dashToken=$dashToken; funnelUrl=''; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
+            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; dashToken=$dashToken; funnelUrl=$serveUrl; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
             $cfg | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8
           } else {
-            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; dashToken=$dashToken; funnelUrl='' } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
+            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; dashToken=$dashToken; funnelUrl=$serveUrl } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
           Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
-      - name: Keep Alive (5h30)
+      - name: Keep Alive (5h30) - hosts dashboard + watcher (so local-pc web link works)
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
+          $cfgPath=Join-Path $sd 'ghrdp_cfg.json'; $serverScript=Join-Path $sd 'rdp-redirect-server.ps1'; $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
+          $progressPath=Join-Path $sd 'ghrdp_progress.json'; $emFlag=Join-Path $sd 'ghrdp_emergency.flag'; $flushFlag=Join-Path $sd 'ghrdp_flush.flag'; $okFile=Join-Path $sd 'ghrdp_server_ok.txt'
+          $cfg=Get-Content $cfgPath -Raw|ConvertFrom-Json
+          Remove-Item $okFile -Force -EA 0
+          $wjob=$null
+          if($cfg.mirror -and (Test-Path $watcherScript)){ try{ $wjob=Start-Job -FilePath $watcherScript -ArgumentList $cfgPath; Write-Host "[watcher] job $($wjob.Id)" }catch{ Write-Host "[watcher] err $_" } }
+          $sjob=$null
+          try{ $sjob=Start-Job -ScriptBlock { param($ss,$port,$bind,$uidir,$prog,$cfgp,$em,$fl,$ok) $ErrorActionPreference='Continue'; try{ . $ss; Start-GhrdpServer -Port $port -BindAddress $bind -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok }catch{ Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii } } -ArgumentList $serverScript,7331,'0.0.0.0',$sd,$progressPath,$cfgPath,$emFlag,$flushFlag,$okFile; Write-Host "[server] job $($sjob.Id)" }catch{ Write-Host "[server] err $_" }
+          for($i=0;$i -lt 30;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ Write-Host "[server] up on 7331"; break }; Start-Sleep -Milliseconds 500 }
+          Write-Host "Dashboard alive: 127.0.0.1:7331 (inside RDP) AND the tailnet web link printed in earlier steps. Keeping alive 5h30..."
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          Write-Host "Session alive 5h30. ONE-CLICK RDP link is in the Summary tab - click it on your pc."
-          while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
-          Write-Host "5h30 done."
+          while(((Get-Date)-$start) -lt $limit){
+            if($sjob -and $sjob.State -ne 'Running'){ Write-Host "[server] died: $(Receive-Job $sjob -EA 0)" }
+            if($wjob -and $wjob.State -ne 'Running'){ Write-Host "[watcher] died: $(Receive-Job $wjob -EA 0)" }
+            Start-Sleep -Seconds 60
+          }
 
       - name: Emergency upload on cancel (always)
         if: ${{ always() && github.event.inputs.mirror_downloads_public == 'true' }}
@@ -1050,6 +1023,7 @@ jobs:
           Set-Clipboard -Value "" -ErrorAction SilentlyContinue; Clear-RecycleBin -Force -ErrorAction SilentlyContinue
           wevtutil el 2>$null | %{wevtutil cl "$_" 2>$null}; $LASTEXITCODE = 0
           & "C:\Program Files\Tailscale\tailscale.exe" funnel --bg 7331 off 2>$null | Out-Null; $LASTEXITCODE=0
+          & "C:\Program Files\Tailscale\tailscale.exe" serve reset 2>$null | Out-Null; $LASTEXITCODE=0
           "### Secure Cleanup Complete" >> $env:GITHUB_STEP_SUMMARY
           "VM wiped (incl D-RDP-Storage). Mirror copies (AES) + rentry index remain if mirror ON. Funnel turned off. No GitHub secrets - recoverable from script." >> $env:GITHUB_STEP_SUMMARY
 
