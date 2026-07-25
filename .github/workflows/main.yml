@@ -16,7 +16,26 @@ jobs:
     steps:
       - name: Download Tailscale
         run: |
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "tailscale-setup.msi" -UseBasicParsing
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $out = "tailscale-setup.msi"
+          $ok = $false
+          # primary: curl.exe with built-in retries (resilient to "connection forcibly closed")
+          for ($a=1; $a -le 4; $a++) {
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+            & curl.exe -fL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 30 --max-time 300 -o $out $url 2>$null
+            $LASTEXITCODE = 0
+            if ((Test-Path $out) -and (Get-Item $out).Length -gt 1000000) { $ok = $true; Write-Host "Downloaded via curl (attempt $a), size=$((Get-Item $out).Length)"; break }
+            Write-Host "curl attempt $a failed, retrying in $((3*$a))s..."; Start-Sleep -Seconds (3 * $a)
+          }
+          # fallback: Invoke-WebRequest with TLS12
+          if (-not $ok) {
+            for ($a=1; $a -le 3; $a++) {
+              try { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing; if ((Test-Path $out) -and (Get-Item $out).Length -gt 1000000) { $ok = $true; Write-Host "Downloaded via IWR (attempt $a)"; break } } catch { Write-Host "IWR attempt $a failed: $_" }
+              Start-Sleep -Seconds (3 * $a)
+            }
+          }
+          if (-not $ok) { throw "Could not download Tailscale MSI after retries (transient network issue - just re-run)." }
 
       - name: Install Tailscale
         run: |
