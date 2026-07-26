@@ -804,23 +804,22 @@ jobs:
           $ErrorActionPreference='Continue'
           $progEarly = Join-Path (Split-Path $CfgPath -Parent) 'ghrdp_progress.json'
           function Write-HB($msg){ try{ $h=@{ts=(Get-Date -f o);alive=$true;agg=@{tracked=0;done=0;active=0;failed=0};files=@();log=@($msg)}; [System.IO.File]::WriteAllText($progEarly,($h|ConvertTo-Json -Depth 6 -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
-          # BOM-safe cfg read (raw ConvertFrom-Json silently died on the UTF-8 BOM -> watcher no-op'd forever)
+          # BOM-safe cfg read
           $cfg=$null
-          try{
-            $b=[System.IO.File]::ReadAllBytes($CfgPath)
-            if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }
-            $cfg=([System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -ErrorAction Stop
-          }catch{ Write-HB ('WATCHER CFG READ FAIL: ' + $_.Exception.Message); throw }
+          try{ $b=[System.IO.File]::ReadAllBytes($CfgPath); if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }; $cfg=([System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF))|ConvertFrom-Json -ErrorAction Stop }catch{ Write-HB ('WATCHER CFG READ FAIL: ' + $_.Exception.Message); throw }
           if(-not $cfg){ Write-HB 'WATCHER CFG NULL'; throw 'cfg null' }
           $env:GHRDP_CFG=$CfgPath; $env:GHRDP_LOG=$cfg.logFile
           . $cfg.libPath
           if(-not (Get-Command Init-Progress -ErrorAction SilentlyContinue)){ Write-HB ('WATCHER LIB NOT LOADED: ' + $cfg.libPath + ' exists=' + (Test-Path $cfg.libPath)); throw 'lib not loaded' }
           Init-Progress $cfg.progressPath
+          # === guaranteed non-null error sink (fixes the iter=N null-method that aborted the whole loop) ===
+          $script:RUNLOG = New-Object System.Collections.ArrayList
+          function LErr($t,$e){ $m=("[{0}] {1}: {2}" -f (Get-Date -f 'HH:mm:ss'),$t,$e.Exception.Message); [void]$script:RUNLOG.Add($m); try{ if($global:GHRDP_PROG -and $global:GHRDP_PROG.log){ $global:GHRDP_PROG.log = @($global:GHRDP_PROG.log) + $m } }catch{}; try{ Add-Content $cfg.logFile $m -EA 0 }catch{} }
           Write-HB 'watcher lib loaded - entering scan loop'
+          try{ Push-Rentry $cfg (Build-Rentry $cfg $idx) | Out-Null }catch{ LErr 'init-err' $_ }
           $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak')
           $done=@{}; if(Test-Path $cfg.doneFile){ Get-Content $cfg.doneFile | %{$done[$_]=$true} }
           $idx=Load-Index $cfg
-          Push-Rentry $cfg (Build-Rentry $cfg $idx) | Out-Null
           function DoUpload($fi,$tag){
             if($done.ContainsKey($fi.FullName)){return}
             $len=$fi.Length; $safe=$fi.Name -replace '\|','_'; $disp=($safe -replace '[^\x20-\x7E]','_')
@@ -833,8 +832,8 @@ jobs:
             Set-Active $disp 'upload' $len
             try { $gofile=Upload-Gofile-Streamed $enc $disp } catch { "upload err $($fi.Name): $_"|Out-File $cfg.logFile -Append }
             Remove-Item $enc -Force -ErrorAction SilentlyContinue
-            if($gofile){ $ex.payload=B64U ($gofile+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gofile; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; $global:GHRDP_DONE_BYTES += $len; Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; "[$(Get-Date -f o)] OK $tag $($fi.Name) ($len bytes)"|Out-File $cfg.logFile -Append }
-            else { $ex.status='limit'; $ex.time=(Get-Date -f 'HH:mm:ss'); Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; "[$(Get-Date -f o)] LIMIT $tag $($fi.Name)"|Out-File $cfg.logFile -Append }
+            if($gofile){ $ex.payload=B64U ($gofile+'|'+$cfg.decPw+'|'+$safe); $ex.gofile=$gofile; $ex.status='ok'; $ex.time=(Get-Date -f 'HH:mm:ss'); $done[$fi.FullName]=$true; $fi.FullName|Out-File $cfg.doneFile -Append; $global:GHRDP_DONE_BYTES += $len; Save-Index $cfg $idx; try{ Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null }catch{ LErr 'push-err' $_ }; "[$(Get-Date -f o)] OK $tag $($fi.Name) ($len bytes)"|Out-File $cfg.logFile -Append }
+            else { $ex.status='limit'; $ex.time=(Get-Date -f 'HH:mm:ss'); Save-Index $cfg $idx; try{ Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null }catch{}; "[$(Get-Date -f o)] LIMIT $tag $($fi.Name)"|Out-File $cfg.logFile -Append }
             Set-Active '' 'idle' 0 }
           function Proc($fi,$tag){ if($done.ContainsKey($fi.FullName)){return}; DoUpload $fi $tag }
           function Scan($r){ if(-not (Test-Path $r.path)){return}; $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue}; foreach($fi in $items){ if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}; if($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}; Proc $fi $r.tag } }
@@ -845,25 +844,33 @@ jobs:
             Start-Sleep -Seconds 4
             for($round=0;$round -lt 3;$round++){ foreach($r in $cfg.roots){ Scan $r }; Start-Sleep -Seconds 4 }
             foreach($r in $cfg.roots){ SweepAll $r }
-            Save-Index $cfg $idx; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null
+            Save-Index $cfg $idx; try{ Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null }catch{ LErr 'emergency-push-err' $_ }
             Remove-Item $cfg.emergencyFlag -Force -ErrorAction SilentlyContinue
             "[$(Get-Date -f o)] EMERGENCY pass end"|Out-File $cfg.logFile -Append }
-          function SyncProg{ $p=$global:GHRDP_PROG; $d=0;$u=0;$f=0; foreach($it in $idx){ if($it.status -eq 'ok'){$d++} elseif($it.status -eq 'limit'){$f++} else {$u++} }; $p.agg.done=$d; $p.agg.failed=$f; $p.agg.tracked=$idx.Count; $p.agg.active=if($p.active.phase -ne 'idle'){1}else{0}; $p.agg.bytesTotal=$global:GHRDP_TOTAL_BYTES; $p.files=@( foreach($it in $idx){ @{name=$it.name;src=$it.src;status=$it.status} } ); if(Test-Path $cfg.logFile){ $p.log=@(Get-Content $cfg.logFile -Tail 40 -ErrorAction SilentlyContinue) } else { $p.log=@() }; Flush-Progress $true }
+          function SyncProg{
+            try{
+              $p=$global:GHRDP_PROG; $d=0;$u=0;$f=0; foreach($it in $idx){ if($it.status -eq 'ok'){$d++} elseif($it.status -eq 'limit'){$f++} else {$u++} }
+              $p.agg.done=$d; $p.agg.failed=$f; $p.agg.tracked=$idx.Count; $p.agg.active=if($p.active.phase -ne 'idle'){1}else{0}; $p.agg.bytesTotal=$global:GHRDP_TOTAL_BYTES
+              $p.files=@( foreach($it in $idx){ @{name=$it.name;src=$it.src;status=$it.status} } )
+              $errs=@($script:RUNLOG | Select-Object -Last 8)
+              $filetail=@(); if(Test-Path $cfg.logFile){ $g=Get-Content $cfg.logFile -Tail 20 -EA 0; if($g){ $filetail=@($g) } }
+              $p.log = @($errs) + $filetail
+              Flush-Progress $true
+            }catch{ LErr 'sync-err' $_ }
+          }
           $fsw=$null
-          try{ if(Test-Path $cfg.dlDir){ $fsw=New-Object System.IO.FileSystemWatcher; $fsw.Path=$cfg.dlDir; $fsw.IncludeSubdirectories=$false; $fsw.EnableRaisingEvents=$true; $fsw.NotifyFilter=[System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::LastWrite } }catch{}
+          try{ if(Test-Path $cfg.dlDir){ $fsw=New-Object System.IO.FileSystemWatcher; $fsw.Path=$cfg.dlDir; $fsw.IncludeSubdirectories=$false; $fsw.EnableRaisingEvents=$true; $fsw.NotifyFilter=[System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::LastWrite } }catch{ LErr 'fsw-err' $_ }
           $iter=0
           while($true){
             $iter++
-            try {
-              if(Test-Path $cfg.emergencyFlag){ EmergencyPass } else {
-                foreach($r in $cfg.roots){ try{ Scan $r }catch{ $global:GHRDP_PROG.log += ("[scan-err] "+$r.tag+": "+$_.Exception.Message) } }
-                if(Test-Path $cfg.flushFlag){ try{ "[$(Get-Date -f o)] FLUSH seen"|Out-File $cfg.logFile -Append; for($p=0;$p -lt 8;$p++){ foreach($r in $cfg.roots){Scan $r}; if(-not ($idx | ?{$_.status -ne 'ok'})){break}; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue }catch{ $global:GHRDP_PROG.log += ("[flush-err] "+$_.Exception.Message) } }
-              }
-              try{ SyncProg }catch{ $global:GHRDP_PROG.log += ("[sync-err] "+$_.Exception.Message) }
-            } catch {
-              try{ $global:GHRDP_PROG.log += ("[loop-err] iter=$iter "+$_.Exception.Message) }catch{}
+            # EVERY sub-op has its own try/catch -> NOTHING can abort the iteration (kills the null-method loop death)
+            if(Test-Path $cfg.emergencyFlag){ try{ EmergencyPass }catch{ LErr 'emergency-err' $_ } }
+            else {
+              foreach($r in $cfg.roots){ try{ Scan $r }catch{ LErr ('scan-err '+$r.tag) $_ } }
+              if(Test-Path $cfg.flushFlag){ try{ "[$(Get-Date -f o)] FLUSH seen"|Out-File $cfg.logFile -Append; for($p=0;$p -lt 8;$p++){ foreach($r in $cfg.roots){Scan $r}; if(-not ($idx | ?{$_.status -ne 'ok'})){break}; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue }catch{ LErr 'flush-err' $_ } }
             }
-            try{ $global:GHRDP_PROG.ts=(Get-Date -f o); $global:GHRDP_PROG.alive=$true; if($global:GHRDP_PROG.log.Count -gt 40){ $global:GHRDP_PROG.log=@($global:GHRDP_PROG.log | Select-Object -Last 40) }; [System.IO.File]::WriteAllText($cfg.progressPath, ($global:GHRDP_PROG | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false)) }catch{}
+            SyncProg
+            try{ $global:GHRDP_PROG.ts=(Get-Date -f o); $global:GHRDP_PROG.alive=$true; [System.IO.File]::WriteAllText($cfg.progressPath, ($global:GHRDP_PROG | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false)) }catch{ LErr 'heartbeat-err' $_ }
             Start-Sleep -Seconds 3
           }
           EOF
