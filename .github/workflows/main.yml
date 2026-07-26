@@ -424,7 +424,15 @@ jobs:
                 }
                 WriteResp $stream 200 'application/json' (JsonBytes $obj); return
               }
-              WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
+              $loop = Is-Loopback $client
+              $html = [System.Text.Encoding]::UTF8.GetString($uiBytes)
+              $ip = if($cfg){ [string]$cfg.rdpIp } else { '' }
+              $us = if($cfg){ [string]$cfg.rdpUser } else { '' }
+              $pw = if($cfg){ [string]$cfg.rdpPass } else { '' }
+              $gh = if($cfg){ [string]$cfg.ghrdp } else { '' }
+              $st = if($loop){ '0' } else { '1' }
+              $html = $html.Replace('__IP__',$ip).Replace('__USER__',$us).Replace('__PASS__',$pw).Replace('__GHRDP__',$gh).Replace('__STATIC__',$st)
+              WriteResp $stream 200 'text/html; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes($html))
             } catch {
               try { WriteResp $stream 200 'application/json' (JsonBytes @{serverTs=(Get-Date -f o);handlerError=$_.Exception.Message;creds=@{ip='';user='';pass=''}}) } catch {}
             }
@@ -452,11 +460,11 @@ jobs:
           <html lang="en">
           <head>
           <meta charset="utf-8">
+          <meta id="ghrdpStatic" name="ghrdp-static" content="__STATIC__">
           <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
           <meta http-equiv="Pragma" content="no-cache">
           <meta http-equiv="Expires" content="0">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <meta http-equiv="refresh" content="60">
           <title>RDP · Mission Control</title>
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -602,12 +610,12 @@ jobs:
               <div class="stack">
                 <div class="panel creds">
                   <div class="lbl" style="margin-bottom:12px">RDP credentials <span style="color:var(--mut);text-transform:none;letter-spacing:0">(auto-filled by handler)</span></div>
-                  <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">-</code><button class="cp" type="button">copy</button></div>
-                  <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">-</code><button class="cp" type="button">copy</button></div>
-                  <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">-</code><button class="cp" type="button">copy</button></div>
+                  <div class="crow" data-k="ip"><span class="ck">IP</span><code id="vIp">__IP__</code><button class="cp" type="button">copy</button></div>
+                  <div class="crow" data-k="user"><span class="ck">USER</span><code id="vUser">__USER__</code><button class="cp" type="button">copy</button></div>
+                  <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">__PASS__</code><button class="cp" type="button">copy</button></div>
                   <div style="margin-top:12px">
                     <div class="lbl" style="margin-bottom:8px">One-click RDP (clickable ghrdp link inside this webapp)</div>
-                    <a id="ghrdpLink" href="#" style="display:block;font-family:var(--mono);font-size:11.5px;color:var(--teal);background:#070b0e;border:1px solid var(--teal-d);border-radius:9px;padding:10px 12px;word-break:break-all;text-decoration:none">ghrdp://…</a>
+                    <a id="ghrdpLink" href="__GHRDP__" style="display:block;font-family:var(--mono);font-size:11.5px;color:var(--teal);background:#070b0e;border:1px solid var(--teal-d);border-radius:9px;padding:10px 12px;word-break:break-all;text-decoration:none">__GHRDP__</a>
                     <p style="font-family:var(--mono);font-size:10px;color:var(--mut);margin-top:7px;line-height:1.5">This ghrdp link is clickable HERE (a web page can link custom schemes; GitHub log/Summary cannot - that is a GitHub rule). On your local pc it works after the one-time connector is installed.</p>
                   </div>
                   <div id="diagBox"><pre id="diagOut">running diagnostics…</pre></div>
@@ -745,7 +753,28 @@ jobs:
             }
             function clearAuthBlocked(){ if(authBlocked){ authBlocked=false; var box=document.getElementById('diagBox'); if(box) box.style.display='none'; } }
             document.getElementById('emBtn').addEventListener('click',function(){ var b=this; b.disabled=true; b.textContent='triggered…'; fetch('/emergency',{cache:'no-store'}).then(function(){ setTimeout(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; },1500); }).catch(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; }); });
-            poll(); setInterval(poll,1500);
+            var STATIC = (document.getElementById('ghrdpStatic')||{}).content === '1';
+            if(STATIC){
+              // LOCAL-PC STATIC VIEW: creds are baked into the HTML at load (no XHR needed),
+              // and we NEVER start the polling loop (that loop is what aborts over the serve proxy).
+              ['ip','user','pass'].forEach(function(k){ var row=document.querySelector('.crow[data-k="'+k+'"]'); if(row){ var c=row.querySelector('code'); row.dataset.val = (c? c.textContent : ''); } });
+              var al=document.getElementById('alive'); if(al){ al.className='pill on'; }
+              var at=document.getElementById('alivetxt'); if(at){ at.textContent='rdp ready'; }
+              var md=document.getElementById('mode'); if(md){ md.className='mode funnel'; md.textContent='⬈ LOCAL PC (click OPEN RDP)'; }
+              var gl=document.getElementById('ghrdpLink'); var rdp=document.getElementById('rdp');
+              if(gl && rdp && gl.href && gl.href.indexOf('ghrdp://')===0){ rdp.href=gl.href; }
+              // DIAGNOSE = one on-demand real-time snapshot (single request works over serve; no interval)
+              document.getElementById('diagBtn').addEventListener('click', function(){
+                var b=document.getElementById('diagBox'); if(b) b.style.display='block';
+                var o=document.getElementById('diagOut'); if(o) o.innerHTML='fetching live snapshot…';
+                fetch('/progress'+location.search,{cache:'no-store'}).then(function(r){ return r.json(); }).then(function(s){
+                  render(s);
+                  if(o){ o.innerHTML='<span class="ok">LIVE SNAPSHOT OK</span> - counters/creds refreshed. (Continuous live view is inside RDP; this public link updates on demand to avoid proxy aborts.)'; }
+                }).catch(function(e){ if(o){ o.innerHTML='<span class="bad">snapshot failed: '+e+'</span>\nCreds shown above are still correct (baked at page load). Click OPEN REMOTE DESKTOP to connect.'; } });
+              });
+            } else {
+              poll(); setInterval(poll,1500);   // inside RDP (loopback) = full continuous live telemetry
+            }
           })();
           </script>
           </body>
