@@ -788,11 +788,22 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/ghrdp-watcher.ps1" <<'EOF'
           param([string]$CfgPath)
-          $ErrorActionPreference='SilentlyContinue'
-          $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
+          $ErrorActionPreference='Continue'
+          $progEarly = Join-Path (Split-Path $CfgPath -Parent) 'ghrdp_progress.json'
+          function Write-HB($msg){ try{ $h=@{ts=(Get-Date -f o);alive=$true;agg=@{tracked=0;done=0;active=0;failed=0};files=@();log=@($msg)}; [System.IO.File]::WriteAllText($progEarly,($h|ConvertTo-Json -Depth 6 -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
+          # BOM-safe cfg read (raw ConvertFrom-Json silently died on the UTF-8 BOM -> watcher no-op'd forever)
+          $cfg=$null
+          try{
+            $b=[System.IO.File]::ReadAllBytes($CfgPath)
+            if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }
+            $cfg=([System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -ErrorAction Stop
+          }catch{ Write-HB ('WATCHER CFG READ FAIL: ' + $_.Exception.Message); throw }
+          if(-not $cfg){ Write-HB 'WATCHER CFG NULL'; throw 'cfg null' }
           $env:GHRDP_CFG=$CfgPath; $env:GHRDP_LOG=$cfg.logFile
           . $cfg.libPath
+          if(-not (Get-Command Init-Progress -ErrorAction SilentlyContinue)){ Write-HB ('WATCHER LIB NOT LOADED: ' + $cfg.libPath + ' exists=' + (Test-Path $cfg.libPath)); throw 'lib not loaded' }
           Init-Progress $cfg.progressPath
+          Write-HB 'watcher lib loaded - entering scan loop'
           $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak')
           $done=@{}; if(Test-Path $cfg.doneFile){ Get-Content $cfg.doneFile | %{$done[$_]=$true} }
           $idx=Load-Index $cfg
