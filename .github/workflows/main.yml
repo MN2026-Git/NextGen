@@ -755,51 +755,23 @@ jobs:
           EOF
 
       # === EDIT 1: launcher - robust Funnel (works when ACL done) + passes funnel status to Summary ===
-      - name: Write Mission Control launcher (server + watcher inside RDP session + live console)
+      - name: Write Mission Control launcher (OBSERVE mode - server runs detached from Keep Alive)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-launcher.ps1" <<'EOF'
           param([string]$CfgPath,[int]$Port=7331)
           $sd=Split-Path $CfgPath -Parent
-          $serverScript=Join-Path $sd 'rdp-redirect-server.ps1'
-          $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
-          $okFile=Join-Path $sd 'ghrdp_server_ok.txt'
           $progressPath=Join-Path $sd 'ghrdp_progress.json'
-          $emFlag=Join-Path $sd 'ghrdp_emergency.flag'
-          $flushFlag=Join-Path $sd 'ghrdp_flush.flag'
           $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json
           function Line($c,$m){ Write-Host ("[{0}] {1}" -f (Get-Date -f 'HH:mm:ss'),$m) -ForegroundColor $c }
-          Line Cyan "============================================================"
-          Line Cyan "  MISSION CONTROL - dashboard + mirror run HERE (in your RDP session)"
-          Line Cyan "  This console window IS your live diagnostic (GitHub log can't show running steps)."
-          Line Cyan "============================================================"
-          Line White ("  IP={0}  USER={1}  MIRROR={2}" -f $cfg.rdpIp,$cfg.rdpUser,$cfg.mirror)
-          Line White ("  INSIDE RDP  -> http://127.0.0.1:{0}/" -f $Port)
-          Remove-Item $okFile -Force -EA 0
-          # watcher (mirror only)
-          $wjob=$null
-          if($cfg.mirror -and (Test-Path $watcherScript)){ try{ $wjob=Start-Job -FilePath $watcherScript -ArgumentList $CfgPath; Line Green ("[watcher] job {0}" -f $wjob.Id) }catch{ Line Red ("[watcher] err {0}" -f $_) } }
-          # server as a JOB in this session (reliable bind + alive while this window is open)
-          $sjob=$null
-          try{
-            $sjob=Start-Job -ScriptBlock { param($ss,$port,$bind,$uidir,$prog,$cfgp,$em,$fl,$ok) $ErrorActionPreference='Continue'; try{ . $ss; Start-GhrdpServer -Port $port -BindAddress $bind -UiDir $uidir -ProgressPath $prog -CfgPath $cfgp -EmergencyFlagPath $em -FlushFlagPath $fl -OkFile $ok -LimitMinutes 330 }catch{ Set-Content $ok ("JOB_EXCEPTION: $_") -Encoding ascii } } -ArgumentList $serverScript,$Port,'0.0.0.0',$sd,$progressPath,$CfgPath,$emFlag,$flushFlag,$okFile
-            Line Green ("[server] job {0} (bind 0.0.0.0)" -f $sjob.Id)
-          }catch{ Line Red ("[server] err {0}" -f $_) }
-          $up=$false
-          for($i=0;$i -lt 30;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ $up=$true; Line Green ("[server] {0}" -f (Get-Content $okFile -Raw).Trim()); break }; if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] died: {0}" -f (Receive-Job $sjob -EA 0)); break }; Start-Sleep -Milliseconds 500 }
-          if(-not $up){ Line Red "[server] did NOT bind - see [server] lines above." }
-          if($up){ try{ Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" }catch{} }
-          Line Cyan "------------------------------------------------------------"
-          Line Cyan "  LIVE STATUS (keep this window open = server stays alive)"
-          Line Cyan "------------------------------------------------------------"
+          Line Cyan "Mission Control (OBSERVE mode) - the dashboard server runs DETACHED from the Keep Alive step; this window only shows live status + opens the RDP-internal tab. Do NOT close if you want to watch status."
+          Line White ("IP={0}  USER={1}  MIRROR={2}" -f $cfg.rdpIp,$cfg.rdpUser,$cfg.mirror)
+          try{ Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" }catch{}
           while($true){
-            $sAlive=($sjob -and $sjob.State -eq 'Running'); $wAlive=($wjob -and $wjob.State -eq 'Running')
-            $listen=(Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')
+            $listen=[bool](Get-NetTCPConnection -LocalPort $Port -State Listen -EA 0)
             $done=0;$act=0;$fail=0;$trk=0;$pct=0
             if(Test-Path $progressPath){ try{ $p=Get-Content $progressPath -Raw|ConvertFrom-Json -EA 0; if($p -and $p.agg){$done=$p.agg.done;$act=$p.agg.active;$fail=$p.agg.failed;$trk=$p.agg.tracked;$pct=$p.agg.overallPct} }catch{} }
-            Line $(if($listen){'Green'}else{'Red'}) ("server={0} listen={1} watcher={2} | done={3} active={4} fail={5} tracked={6} overall={7}%" -f $sAlive,$listen,$wAlive,$done,$act,$fail,$trk,$pct)
-            if($sjob -and $sjob.State -ne 'Running'){ Line Red ("[server] NOT RUNNING: {0}" -f (Receive-Job $sjob -EA 0)) }
-            if($wjob -and $wjob.State -ne 'Running'){ Line Red ("[watcher] NOT RUNNING: {0}" -f (Receive-Job $wjob -EA 0)) }
+            Line $(if($listen){'Green'}else{'Red'}) ("listen={0} | done={1} active={2} fail={3} tracked={4} overall={5}%" -f $listen,$done,$act,$fail,$trk,$pct)
             Start-Sleep -Seconds 2
           }
           EOF
@@ -996,14 +968,37 @@ jobs:
           Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
-      - name: Keep Alive (5h30) - simple sleep (server runs inside RDP session, see Mission Control console)
+      - name: Keep Alive (5h30) - server+watcher DETACHED (build-time alive -> local-pc link works)
         run: |
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
-          Write-Host "Session alive 5h30. Dashboard server runs INSIDE the RDP session (Mission Control console window shows live status - NOT in this log, because running steps cannot be expanded)."
-          Write-Host "Local-pc web link = the SERVE_WEBAPP_LINK printed in earlier steps. Inside RDP = http://127.0.0.1:7331/ (after double-click Mission Control)."
+          $cfgPath=Join-Path $sd 'ghrdp_cfg.json'; $serverScript=Join-Path $sd 'rdp-redirect-server.ps1'; $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
+          $progressPath=Join-Path $sd 'ghrdp_progress.json'; $emFlag=Join-Path $sd 'ghrdp_emergency.flag'; $flushFlag=Join-Path $sd 'ghrdp_flush.flag'; $okFile=Join-Path $sd 'ghrdp_server_ok.txt'
+          $cfg=Get-Content $cfgPath -Raw|ConvertFrom-Json
+          Remove-Item $okFile -Force -EA 0
+          function Start-ServerProc {
+            $cmd = "& { . '" + $serverScript + "' ; Start-GhrdpServer -Port 7331 -BindAddress '0.0.0.0' -UiDir '" + $sd + "' -ProgressPath '" + $progressPath + "' -CfgPath '" + $cfgPath + "' -EmergencyFlagPath '" + $emFlag + "' -FlushFlagPath '" + $flushFlag + "' -OkFile '" + $okFile + "' -LimitMinutes 330 }"
+            return (Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-WindowStyle","Hidden","-Command",$cmd) -PassThru)
+          }
+          function Start-WatcherProc {
+            $wcmd = "& '" + $watcherScript + "' '" + $cfgPath + "'"
+            return (Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-WindowStyle","Hidden","-Command",$wcmd) -PassThru)
+          }
+          $sproc = Start-ServerProc; Write-Host "[server] detached pid $($sproc.Id) (NOT foreground -> step won't block; NOT Start-Job -> no job-isolation flake)"
+          $up=$false
+          for($i=0;$i -lt 40;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ $up=$true; Write-Host "[server] $((Get-Content $okFile -Raw).Trim())"; break }; Start-Sleep -Milliseconds 500 }
+          if(-not $up){ Write-Host "[server] bind wait timeout - will keep health-checking/respawning below" }
+          $wproc=$null
+          if($cfg.mirror -and (Test-Path $watcherScript)){ $wproc=Start-WatcherProc; Write-Host "[watcher] detached pid $($wproc.Id)" }
+          $self=$false; try{ Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $self=$true }catch{}
+          Write-Host "[selftest] loopback 7331 = $self  (if True -> local-pc serve link will NOT 502)"
+          Write-Host "Keep Alive 5h30 - detached server+watcher, health-checked every 60s (respawn if dead)"
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
-          while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
+          while(((Get-Date)-$start) -lt $limit){
+            if(-not (Get-Process -Id $sproc.Id -EA 0)){ Write-Host "[server] died - respawning"; Remove-Item $okFile -Force -EA 0; $sproc=Start-ServerProc; Write-Host "[server] new pid $($sproc.Id)" }
+            if($cfg.mirror -and $wproc -and -not (Get-Process -Id $wproc.Id -EA 0)){ Write-Host "[watcher] died - respawning"; $wproc=Start-WatcherProc; Write-Host "[watcher] new pid $($wproc.Id)" }
+            Start-Sleep -Seconds 60
+          }
           Write-Host "5h30 done."
 
       - name: Emergency upload on cancel (always)
