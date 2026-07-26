@@ -153,6 +153,7 @@ jobs:
           Write-Host "        Name = TS_AUTHKEY"
           Write-Host "        Value = paste tskey-auth-..."
           Write-Host "STEP 3  Re-run workflow. Tailscale will then login automatically forever."
+          Write-Host "        (NO extra credentials are needed for file uploads - gofile + telegraph are anonymous.)"
           Write-Host "========================================================="
 
           $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
@@ -412,18 +413,72 @@ jobs:
     - name: Create secure random RDP account + D-RDP-Storage
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Continue'
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-        $alpha = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
-        $bytes = [byte[]]::new(24)
-        $rng.GetBytes($bytes)
-        $pass = -join ($bytes | ForEach-Object { $alpha[[int]$_ % $alpha.Length] })
-
+        # Username first, so the password generator can avoid containing it.
         $hb = [byte[]]::new(4)
         $rng.GetBytes($hb)
         $user = 'rdp' + (-join ($hb | ForEach-Object { $_.ToString('x2') }))
 
-        New-LocalUser -Name $user -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -FullName "RDP Session" -PasswordNeverExpires -ErrorAction Stop | Out-Null
+        # Policy-proof password:
+        #  - always contains all 4 complexity categories (lower/upper/digit/special)
+        #  - never contains a 3-char slice of the username or the full name
+        #  - special set is chosen to be safe in URLs, cmdkey, HTML, JSON, GITHUB_ENV and shell
+        # These are the two real causes of New-LocalUser InvalidPasswordException.
+        function New-SafePassword {
+          param([string]$UserName, [string]$FullName, [int]$Length = 24)
+          $lower   = 'abcdefghijkmnopqrstuvwxyz'
+          $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $digit   = '23456789'
+          $special = '!@^-_+~'
+          $all     = $lower + $upper + $digit + $special
+          $buf4    = [byte[]]::new(4)
+          function RandInt([int]$max) { $rng.GetBytes($buf4); $u = [BitConverter]::ToUInt32($buf4, 0); return [int]($u % [uint32]$max) }
+          function Pick([string]$set) { return [string]$set[(RandInt $set.Length)] }
+          $bad = New-Object System.Collections.Generic.HashSet[string]
+          foreach ($src in @($UserName, $FullName)) {
+            $s = ([string]$src).ToLower()
+            for ($i = 0; $i -le ($s.Length - 3); $i++) { [void]$bad.Add($s.Substring($i, 3)) }
+          }
+          for ($attempt = 0; $attempt -lt 500; $attempt++) {
+            $arr = [char[]]::new($Length)
+            $arr[0] = (Pick $lower)[0]
+            $arr[1] = (Pick $upper)[0]
+            $arr[2] = (Pick $digit)[0]
+            $arr[3] = (Pick $special)[0]
+            for ($i = 4; $i -lt $Length; $i++) { $arr[$i] = (Pick $all)[0] }
+            for ($i = $Length - 1; $i -gt 0; $i--) { $j = RandInt ($i + 1); $tmp = $arr[$i]; $arr[$i] = $arr[$j]; $arr[$j] = $tmp }
+            $cand = -join $arr
+            $low = $cand.ToLower()
+            $ok = $true
+            foreach ($t in $bad) { if ($t -and $low.Contains($t)) { $ok = $false; break } }
+            if ($ok) { return $cand }
+          }
+          throw 'Could not generate a policy-safe password.'
+        }
+
+        $created = $false
+        $pass = $null
+        for ($try = 0; $try -lt 6; $try++) {
+          $pass = New-SafePassword -UserName $user -FullName 'RDP Session' -Length (24 + $try)
+          try {
+            New-LocalUser -Name $user -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -FullName "RDP Session" -PasswordNeverExpires -ErrorAction Stop | Out-Null
+            $created = $true
+            break
+          } catch {
+            $isPwd = ($_.Exception -is [Microsoft.PowerShell.Commands.InvalidPasswordException]) -or
+                     ($_.Exception.InnerException -is [Microsoft.PowerShell.Commands.InvalidPasswordException]) -or
+                     ($_.ToString() -match 'InvalidPasswordException')
+            if ($isPwd) {
+              Write-Host "Local policy rejected the password (attempt $try); regenerating with more entropy + length..."
+            } else {
+              throw
+            }
+          }
+        }
+        if (-not $created) { throw "New-LocalUser kept rejecting passwords - the runner image has a non-standard local password policy." }
+
         Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
         Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
 
@@ -1425,7 +1480,7 @@ jobs:
           try {
             $wArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watcherScript`" -CfgPath `"$CfgPath`""
             Start-Process -FilePath $ps -ArgumentList $wArgs -WindowStyle Hidden | Out-Null
-            Line Green "[watcher] started in RDP session fallback"
+            Line Green "[watcher] started in RDP session fallback (mutex prevents doubles)"
           } catch {
             Line Red ("[watcher] start err " + $_.Exception.Message)
           }
@@ -1529,14 +1584,22 @@ jobs:
           if (-not $pwsh) { $pwsh = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
           Set-Item -Path "$root\shell\open\command" -Value "`"$pwsh`" -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$helperPath`" `"%1`""
 
+          $ok = [bool](Get-ItemProperty -Path "$root\shell\open\command" -ErrorAction SilentlyContinue)
+          $ok = $ok -and (Test-Path $helperPath)
+
           Write-Host ''
-          Write-Host 'SUCCESS - RDP connector installed.'
-          Write-Host 'Now click the ghrdp link again.'
+          if ($ok) {
+            Write-Host 'SUCCESS - RDP connector installed. Now click the ghrdp link again.' -ForegroundColor Green
+            Write-Host 'If the browser asks "Open app?" tick Always-allow + Open once.' -ForegroundColor Yellow
+          } else {
+            Write-Host 'INSTALL LOOKS INCOMPLETE - re-run via Right-click -> Run with PowerShell.' -ForegroundColor Red
+          }
         } catch {
           Write-Host "INSTALL ERROR: $($_.Exception.Message)"
+          Write-Host 'Common fix: Set-ExecutionPolicy -Scope CurrentUser Bypass -Force' -ForegroundColor Cyan
         }
 
-        Read-Host 'Press Enter to close'
+        try { Read-Host 'Press Enter to close' } catch {}
         INSTALLEOF
 
     - name: Configure theme + bookmarks + apps + Mission Control shortcut + watcher startup
@@ -2263,7 +2326,7 @@ jobs:
         $LASTEXITCODE = 0
 
         Write-Host "[server] SYSTEM task ghrdpserver created+run"
-        Write-Host "[watcher] no scheduled task. It starts at RDP logon or via Mission Control fallback."
+        Write-Host "[watcher] no scheduled task. It starts at RDP logon (Startup shortcut) or via Mission Control fallback."
 
         $up = $false
         for ($i = 0; $i -lt 40; $i++) {
