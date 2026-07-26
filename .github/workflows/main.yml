@@ -279,7 +279,7 @@ jobs:
           Write-Host ('>>> Manual mstsc: mstsc -> ' + $ip + '  user ' + $user + '  pass ' + $pass)
           Write-Host '============================================================'
 
-      - name: Write mirror lib (shared functions)
+      - name: Write mirror lib (shared functions; telegraph index + safe IO)
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
         shell: bash
         run: |
@@ -287,6 +287,7 @@ jobs:
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ErrorActionPreference = 'SilentlyContinue'
           function Read-Cfg { $b=[System.IO.File]::ReadAllBytes($env:GHRDP_CFG); if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }; $t=[System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF); return ($t | ConvertFrom-Json) }
+          function Save-Cfg($c){ [System.IO.File]::WriteAllText($c.cfgPath, ($c | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding $false)) }
           function B64U($s){ $x=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($s)); return $x.Replace('+','-').Replace('/','_').TrimEnd('=') }
           $global:GHRDP_PROG = @{ ts=''; alive=$true; active=@{name='';phase='idle';bytesDone=0;bytesTotal=0;pct=0;speedBps=0}; agg=@{total=0;done=0;active=0;failed=0;tracked=0;bytesDone=0;bytesTotal=0;overallPct=0;speedBps=0}; files=@(); log=@() }
           $global:GHRDP_PROG_PATH = $null; $global:GHRDP_LASTFLUSH = 0
@@ -332,23 +333,35 @@ jobs:
             $LASTEXITCODE=0; Start-Sleep -Seconds (5*$a)
           }
           return $null }
-          function Push-Rentry($cfg,$text){
-          for ($n=0; $n -lt 2; $n++){
-            try { $out=& curl.exe -s -S --max-time 30 -X POST ("https://rentry.co/api/edit/"+$cfg.slug) --data-urlencode "edit_code=$($cfg.editCode)" --data-urlencode "text=$text" --data-urlencode "update_mode=replace" 2>$null
-            $j=$out|ConvertFrom-Json -ErrorAction Stop; if("$($j.status)" -eq '200'){return $true}; "rentry $($j.status)"|Out-File $env:GHRDP_LOG -Append } catch { "rentry err $_"|Out-File $env:GHRDP_LOG -Append }
-            $LASTEXITCODE=0; Start-Sleep -Seconds 3 }
-          return $false }
           function Load-Index($cfg){ if(Test-Path $cfg.idxFile){ try{ return [System.Collections.ArrayList]@(Get-Content $cfg.idxFile -Raw|ConvertFrom-Json -ErrorAction Stop) }catch{} }; return (New-Object System.Collections.ArrayList) }
           function Save-Index($cfg,$idx){ [System.IO.File]::WriteAllText($cfg.idxFile, ($idx|ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding $false)) }
-          function Icon($s){ if($s -eq 'ok'){return 'OK'} elseif($s -eq 'limit'){return 'LIMIT'} else {return '...' } }
+          # === INDEX PAGE = Telegraph (telegra.ph): automated, no login, no secret, permanent. rentry removed (was unreliable). ===
           function Build-Rentry($cfg,$idx){
-          $sb=New-Object System.Text.StringBuilder
-          [void]$sb.AppendLine("# GitHub RDP - mirrored files"); [void]$sb.AppendLine("")
-          [void]$sb.AppendLine("Files are **AES-256 encrypted** on gofile. **Decrypt password:** ``$($cfg.decPw)``"); [void]$sb.AppendLine("")
-          [void]$sb.AppendLine("| # | File | Status | One-click | gofile | Source | Time |"); [void]$sb.AppendLine("|---|---|---|---|---|---|---|")
-          if($idx.Count -eq 0){ [void]$sb.AppendLine("| - | _(none yet)_ | - | - | - | - | - |") }
-          $n=1; foreach($it in $idx){ $oc=if($it.status -eq 'ok'){'[open](ghrdp://dl/'+$it.payload+')'}else{'-'}; $gf=if($it.gofile){'[gofile]('+$it.gofile+')'}else{'-'}; [void]$sb.AppendLine("| $n | "+$it.name+" | "+(Icon $it.status)+" | "+$oc+" | "+$gf+" | "+$it.src+" | "+$it.time+" |"); $n++ }
-          [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
+            $nodes=New-Object System.Collections.ArrayList
+            [void]$nodes.Add(@{tag='h3';children=@('GitHub RDP - mirrored files')})
+            [void]$nodes.Add(@{tag='p';children=@('Files are AES-256 encrypted on gofile. Decrypt password: ',$cfg.decPw)})
+            if($idx.Count -eq 0){ [void]$nodes.Add(@{tag='p';children=@('(no files yet)')}) }
+            $n=1; foreach($it in $idx){
+              $kids=New-Object System.Collections.ArrayList
+              [void]$kids.Add(("$n. " + $it.name + " [" + $it.status + "] " + $it.src + " " + $it.time + " "))
+              if($it.gofile){ [void]$kids.Add(@{tag='a';attrs=@{href=$it.gofile};children=@('gofile')}) }
+              [void]$nodes.Add(@{tag='p';children=$kids}); $n++
+            }
+            return ($nodes | ConvertTo-Json -Depth 8 -Compress)
+          }
+          function Push-Rentry($cfg,$text){
+            $title='GitHub RDP - mirrored files'
+            if(-not $cfg.telegraphToken){
+              try { $acc=Invoke-RestMethod -Method Post -Uri 'https://api.telegra.ph/createAccount' -Body @{short_name='ghrdp';author_name='GitHub RDP Mirror'} -TimeoutSec 30; if($acc.ok){ $cfg.telegraphToken=$acc.result.access_token } } catch { "telegraph createAccount err $_"|Out-File $cfg.logFile -Append; $LASTEXITCODE=0; return $false }
+            }
+            if(-not $cfg.telegraphToken){ return $false }
+            try {
+              if(-not $cfg.telegraphPath){ $pg=Invoke-RestMethod -Method Post -Uri 'https://api.telegra.ph/createPage' -Body @{access_token=$cfg.telegraphToken;title=$title;content=$text;return_content='false'} -TimeoutSec 30; if($pg.ok){ $cfg.telegraphPath=$pg.result.path; $cfg.rentryUrl=$pg.result.url } }
+              else { $pg=Invoke-RestMethod -Method Post -Uri 'https://api.telegra.ph/editPage' -Body @{access_token=$cfg.telegraphToken;path=$cfg.telegraphPath;title=$title;content=$text;return_content='false'} -TimeoutSec 30; if($pg.ok){ $cfg.rentryUrl=$pg.result.url } }
+            } catch { "telegraph page err $_"|Out-File $cfg.logFile -Append; $LASTEXITCODE=0; return $false }
+            Save-Cfg $cfg
+            return [bool]$cfg.rentryUrl
+          }
           EOF
 
       - name: Write dashboard server script (NO token gate + BOM-safe + rich /diag)
@@ -850,12 +863,7 @@ jobs:
             } catch {
               try{ $global:GHRDP_PROG.log += ("[loop-err] iter=$iter "+$_.Exception.Message) }catch{}
             }
-            # DIRECT heartbeat every 3s (proven WriteAllText path, NO atomic Move) -> JS diag never sees stale even if a sub-call throws
-            try{
-              $global:GHRDP_PROG.ts=(Get-Date -f o); $global:GHRDP_PROG.alive=$true
-              if($global:GHRDP_PROG.log.Count -gt 40){ $global:GHRDP_PROG.log = @($global:GHRDP_PROG.log | Select-Object -Last 40) }
-              [System.IO.File]::WriteAllText($global:GHRDP_PROG_PATH, ($global:GHRDP_PROG | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false))
-            }catch{ try{ [System.IO.File]::WriteAllText($progEarly, (@{ts=(Get-Date -f o);alive=$true;log=@("[hb-err] "+$_.Exception.Message)}|ConvertTo-Json -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
+            try{ $global:GHRDP_PROG.ts=(Get-Date -f o); $global:GHRDP_PROG.alive=$true; if($global:GHRDP_PROG.log.Count -gt 40){ $global:GHRDP_PROG.log=@($global:GHRDP_PROG.log | Select-Object -Last 40) }; [System.IO.File]::WriteAllText($cfg.progressPath, ($global:GHRDP_PROG | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false)) }catch{}
             Start-Sleep -Seconds 3
           }
           EOF
@@ -1066,10 +1074,10 @@ jobs:
             $dlDir="C:\Users\$user\Downloads"; $tempDir="C:\Users\$user\AppData\Local\Temp"
             $roots=@(@{path=$dlDir;rec=$false;min=0;tag='Downloads'},@{path=$tempDir;rec=$true;min=102400;tag='Temp'})
             if(Test-Path 'D:\RDP-Storage'){ $roots += @{path='D:\RDP-Storage';rec=$true;min=0;tag='D-Storage'}; Write-Host "D-Storage added to mirror." }
-            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl='https://rentry.co/Rt7mK2pL9vQ4wX8nB3cF6zYe'; editCode='Gf5xW9qL2mK7pR4tBn3Y'; slug='Rt7mK2pL9vQ4wX8nB3cF6zYe'; decPw=$decPw; dashToken=$dashToken; funnelUrl=$serveUrl; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
+            $cfg=@{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$true; rentryUrl=''; telegraphToken=''; telegraphPath=''; decPw=$decPw; dashToken=$dashToken; funnelUrl=$serveUrl; user=$user; dlDir=$dlDir; tempDir=$tempDir; roots=$roots; idxFile=$indexPath; doneFile=(Join-Path $sd 'ghrdp_uploaded.txt'); logFile=(Join-Path $sd 'ghrdp_mirror.log'); flushFlag=(Join-Path $sd 'ghrdp_flush.flag'); cfgPath=$cfgPath; libPath=(Join-Path $sd 'ghrdp-lib.ps1'); heartbeatPath=$hbPath; emergencyFlag=$emPath; cancelFlag=$cfPath; allDoneFlag=$adPath; progressPath=$progressPath; tmpDir=(Join-Path $sd 'ghrdp_tmp') }
             $cfg | ConvertTo-Json -Depth 6 | Set-Content $cfgPath -Encoding UTF8
           } else {
-            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; dashToken=$dashToken; funnelUrl=$serveUrl } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
+            @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; telegraphToken=''; telegraphPath=''; dashToken=$dashToken; funnelUrl=$serveUrl } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
           Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
