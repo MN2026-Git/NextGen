@@ -295,7 +295,7 @@ jobs:
           function Init-Progress($path){ $global:GHRDP_PROG_PATH=$path; $n=[datetime]::Now.Ticks; $global:GHRDP_SP=@{t=$n;b=0}; $global:GHRDP_SP_A=@{t=$n;b=0} }
           function Set-Active($name,$phase,$total){ $a=$global:GHRDP_PROG.active; $a.name=$name; $a.phase=$phase; $a.bytesDone=0; $a.bytesTotal=[long]$total; $a.pct=0; $a.speedBps=0; $global:GHRDP_SP_A=@{t=[datetime]::Now.Ticks;b=0} }
           function Tick-Bytes($n){ $p=$global:GHRDP_PROG; $p.active.bytesDone += [long]$n; $now=[datetime]::Now.Ticks; if(($now-$global:GHRDP_LASTFLUSH) -gt 2000000){ Flush-Progress $false } }
-          function Flush-Progress($force){ $now=[datetime]::Now.Ticks; if(-not $force -and ($now-$global:GHRDP_LASTFLUSH) -lt 2000000){ return }; $global:GHRDP_LASTFLUSH=$now; $p=$global:GHRDP_PROG; $p.ts=[datetime]::Now.ToString('o'); $comp = $global:GHRDP_DONE_BYTES + $(if($p.active.phase -eq 'upload'){ $p.active.bytesDone } else { 0 }); $dt=($now-$global:GHRDP_SP.t)/10000000.0; if($dt -gt 0.5){ $p.agg.speedBps=[math]::Max(0,[math]::Round(($comp-$global:GHRDP_SP.b)/$dt)); $global:GHRDP_SP=@{t=$now;b=$comp} }; $dta=($now-$global:GHRDP_SP_A.t)/10000000.0; if($dta -gt 0.5){ $p.active.speedBps=[math]::Max(0,[math]::Round(($p.active.bytesDone-$global:GHRDP_SP_A.b)/$dta)); $global:GHRDP_SP_A=@{t=$now;b=$p.active.bytesDone} }; if($p.active.bytesTotal -gt 0){ $p.active.pct=[math]::Round(100.0*$p.active.bytesDone/$p.active.bytesTotal,1) } else { $p.active.pct=0 }; $p.agg.bytesDone=$comp; if($p.agg.bytesTotal -gt 0){ $p.agg.overallPct=[math]::Round(100.0*$comp/$p.agg.bytesTotal,1) } else { $p.agg.overallPct=0 }; if($global:GHRDP_PROG_PATH){ try{ [System.IO.File]::WriteAllText($global:GHRDP_PROG_PATH, ($p | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false)) }catch{} } }
+          function Flush-Progress($force){ $now=[datetime]::Now.Ticks; if(-not $force -and ($now-$global:GHRDP_LASTFLUSH) -lt 2000000){ return }; $global:GHRDP_LASTFLUSH=$now; $p=$global:GHRDP_PROG; $p.ts=[datetime]::Now.ToString('o'); $comp = $global:GHRDP_DONE_BYTES + $(if($p.active.phase -eq 'upload'){ $p.active.bytesDone } else { 0 }); $dt=($now-$global:GHRDP_SP.t)/10000000.0; if($dt -gt 0.5){ $p.agg.speedBps=[math]::Max(0,[math]::Round(($comp-$global:GHRDP_SP.b)/$dt)); $global:GHRDP_SP=@{t=$now;b=$comp} }; $dta=($now-$global:GHRDP_SP_A.t)/10000000.0; if($dta -gt 0.5){ $p.active.speedBps=[math]::Max(0,[math]::Round(($p.active.bytesDone-$global:GHRDP_SP_A.b)/$dta)); $global:GHRDP_SP_A=@{t=$now;b=$p.active.bytesDone} }; if($p.active.bytesTotal -gt 0){ $p.active.pct=[math]::Round(100.0*$p.active.bytesDone/$p.active.bytesTotal,1) } else { $p.active.pct=0 }; $p.agg.bytesDone=$comp; if($p.agg.bytesTotal -gt 0){ $p.agg.overallPct=[math]::Round(100.0*$comp/$p.agg.bytesTotal,1) } else { $p.agg.overallPct=0 }; if($global:GHRDP_PROG_PATH){ try{ $tmp=$global:GHRDP_PROG_PATH+'.tmp'; [System.IO.File]::WriteAllText($tmp, ($p | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false)); [System.IO.File]::Move($tmp,$global:GHRDP_PROG_PATH,$true) }catch{} } }
           function Encrypt-File($inPath,$outPath,$password){
           $aes=[System.Security.Cryptography.Aes]::Create(); $aes.KeySize=256; $aes.Mode='CBC'; $aes.Padding='PKCS7'
           $salt=[byte[]]::new(16); ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($salt)
@@ -364,14 +364,15 @@ jobs:
           function ReadJsonSafe($path,[ref]$errVar){
             if(-not (Test-Path $path)){ $errVar.Value='file-missing'; return $null }
             try {
-              $bytes=[System.IO.File]::ReadAllBytes($path)
+              # SHARED read (FileShare.ReadWrite) = never blocks on watcher's write lock (fixes 39s /diag + partial transfer)
+              $fs=[System.IO.File]::Open($path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
+              $ms=New-Object System.IO.MemoryStream; $fs.CopyTo($ms); $fs.Close()
+              $bytes=$ms.ToArray(); $ms.Close()
               if($bytes.Length -eq 0){ $errVar.Value='empty-file'; return $null }
-              # strip UTF-8 BOM if present
               if($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF){ $bytes=$bytes[3..($bytes.Length-1)] }
-              $txt=[System.Text.Encoding]::UTF8.GetString($bytes)
-              $txt=$txt.TrimStart([char]0xFEFF)
+              $txt=[System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
               return ($txt | ConvertFrom-Json -ErrorAction Stop)
-            } catch { $errVar.Value=('parse: ' + $_.Exception.Message); return $null }
+            } catch { $errVar.Value=('read/parse: ' + $_.Exception.Message); return $null }
           }
           function ParseHeaders($raw){
             $h=@{}; $lines=$raw -split "`r`n"; for($i=1;$i -lt $lines.Length;$i++){ $l=$lines[$i]; $ix=$l.IndexOf(':'); if($ix -gt 0){ $h[($l.Substring(0,$ix).Trim().ToLower())]=$l.Substring($ix+1).Trim() } }
