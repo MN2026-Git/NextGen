@@ -425,7 +425,7 @@ jobs:
           }
           SERVEREOF
 
-      - name: Write dashboard UI (rich Mission Control - live telemetry + rendered diagnostics)
+      - name: Write dashboard UI (rich Mission Control - live on local pc too + clickable ghrdp)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/ghrdp-ui.html" <<'UIEOF'
@@ -444,15 +444,7 @@ jobs:
           :root{--bg:#080b10;--panel:#10161d;--panel2:#0c1117;--line:#1f2b35;--line2:#2a3a47;--ink:#eef3f7;--mut:#8298a6;--teal:#34d3b6;--teal-d:#0d3a32;--amber:#f4ad3c;--amber-d:#3a2c0e;--red:#ef5d45;--red-d:#3a1712;--green:#43d98f;--violet:#9b8cff;--mono:'JetBrains Mono',ui-monospace,monospace;--disp:'Space Grotesk',system-ui,sans-serif;--body:'IBM Plex Sans',system-ui,sans-serif}
           *{box-sizing:border-box;margin:0;padding:0}
           html,body{height:100%}
-          body{font-family:var(--body);color:var(--ink);min-height:100vh;padding:22px 18px 60px;position:relative;overflow-x:hidden;
-            background:
-              radial-gradient(1100px 600px at 8% -10%, rgba(52,211,182,.10), transparent 60%),
-              radial-gradient(900px 700px at 102% 8%, rgba(244,173,60,.07), transparent 55%),
-              radial-gradient(800px 800px at 50% 120%, rgba(155,140,255,.06), transparent 60%),
-              linear-gradient(rgba(255,255,255,.020) 1px, transparent 1px),
-              linear-gradient(90deg, rgba(255,255,255,.020) 1px, transparent 1px),
-              var(--bg);
-            background-size:auto,auto,auto,30px 30px,30px 30px,auto}
+          body{font-family:var(--body);color:var(--ink);min-height:100vh;padding:22px 18px 60px;position:relative;overflow-x:hidden;background:radial-gradient(1100px 600px at 8% -10%,rgba(52,211,182,.10),transparent 60%),radial-gradient(900px 700px at 102% 8%,rgba(244,173,60,.07),transparent 55%),radial-gradient(800px 800px at 50% 120%,rgba(155,140,255,.06),transparent 60%),linear-gradient(rgba(255,255,255,.020) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.020) 1px,transparent 1px),var(--bg);background-size:auto,auto,auto,30px 30px,30px 30px,auto}
           body::before{content:"";position:fixed;inset:0 0 auto 0;height:3px;background:linear-gradient(90deg,var(--teal),var(--amber),var(--red),var(--violet));opacity:.9;z-index:50}
           .wrap{max-width:1240px;margin:0 auto;animation:rise .5s ease both}
           @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
@@ -491,6 +483,10 @@ jobs:
           .phase.idle{background:#161e25;color:var(--mut)}
           .mini{height:8px;border-radius:999px;background:#070b0f;border:1px solid var(--line);overflow:hidden}
           .mini>i{display:block;height:100%;background:var(--amber);width:0%;transition:width .35s linear}
+          .eyes{margin-top:14px;border-top:1px dashed var(--line);padding-top:14px}
+          .eye-row{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11.5px;padding:5px 0;border-bottom:1px solid #131b22}
+          .eye-row .t{color:var(--ink)}.eye-row .v{color:var(--mut)}
+          .eye-row .v.warn{color:var(--amber)}.eye-row .v.bad{color:var(--red)}.eye-row .v.ok{color:var(--teal)}
           .stats{display:grid;grid-template-columns:1fr 1fr;gap:12px}
           .tile{background:var(--panel2);border:1px solid var(--line);border-radius:13px;padding:15px 16px;transition:transform .15s ease,border-color .15s ease}
           .tile:hover{transform:translateY(-3px);border-color:var(--line2)}
@@ -511,10 +507,6 @@ jobs:
           .banner.safe{display:block;background:linear-gradient(180deg,#16402c,#0f2a1d);color:var(--green);border:1px solid #1f6f43}
           .banner.warn{display:block;background:var(--amber-d);color:var(--amber);border:1px solid #6b4414}
           .lower{display:grid;grid-template-columns:1.3fr 1fr;gap:16px;margin-top:16px}
-          .eyes{margin-top:14px;border-top:1px dashed var(--line);padding-top:14px}
-          .eye-row{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11.5px;padding:5px 0;border-bottom:1px solid #131b22}
-          .eye-row .t{color:var(--ink)}.eye-row .v{color:var(--mut)}
-          .eye-row .v.warn{color:var(--amber)}.eye-row .v.bad{color:var(--red)}.eye-row .v.ok{color:var(--teal)}
           .files .head,.frow{display:grid;grid-template-columns:74px 1fr 96px 60px;gap:10px;align-items:center}
           .files .head{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);padding:0 4px 10px;border-bottom:1px solid var(--line)}
           .flist{max-height:300px;overflow:auto;margin-top:6px}
@@ -553,39 +545,14 @@ jobs:
           <body>
           <div class="wrap">
             <header>
-              <div class="brand">
-                <div class="logo">R</div>
-                <div><h1>Mission Control</h1><span class="tag">live mirror telemetry · RDP</span></div>
-              </div>
-              <div class="hstat">
-                <span class="clock" id="clock">--:--:--</span>
-                <span class="chip" id="mode">checking…</span>
-                <button class="diagbtn" id="diagBtn" type="button">🔍 DIAGNOSE</button>
-                <span class="pill" id="alive"><span class="d"></span><span id="alivetxt">checking</span></span>
-              </div>
+              <div class="brand"><div class="logo">R</div><div><h1>Mission Control</h1><span class="tag">live mirror telemetry · RDP</span></div></div>
+              <div class="hstat"><span class="clock" id="clock">--:--:--</span><span class="chip" id="mode">checking…</span><button class="diagbtn" id="diagBtn" type="button">🔍 DIAGNOSE</button><span class="pill" id="alive"><span class="d"></span><span id="alivetxt">checking</span></span></div>
             </header>
-
             <div class="grid">
               <div class="stack">
-                <div class="panel hero">
-                  <div class="lbl">Overall uploaded</div>
-                  <div class="pct"><span id="pct">0</span><small>%</small></div>
-                  <div class="track"><div class="fill" id="fill"></div></div>
-                  <div class="meta">
-                    <span><b id="bDone">0 B</b> / <span id="bTotal">0 B</span></span>
-                    <span>throughput <b id="speed">0 B/s</b></span>
-                    <span>eta <b id="eta">—</b></span>
-                  </div>
-                </div>
-                <div class="panel active">
-                  <div class="lbl">Active transfer</div>
-                  <div class="row1"><span class="fname" id="aName">idle</span><span class="phase idle" id="aPhase">idle</span></div>
-                  <div class="mini"><i id="aBar"></i></div>
-                  <div class="meta" style="margin-top:10px"><span><b id="aBytes">0 B</b> / <span id="aTotal">0 B</span></span><span><b id="aSpeed">0 B/s</b></span></div>
-                  <div class="eyes" id="eyes"></div>
-                </div>
+                <div class="panel hero"><div class="lbl">Overall uploaded</div><div class="pct"><span id="pct">0</span><small>%</small></div><div class="track"><div class="fill" id="fill"></div></div><div class="meta"><span><b id="bDone">0 B</b> / <span id="bTotal">0 B</span></span><span>throughput <b id="speed">0 B/s</b></span><span>eta <b id="eta">—</b></span></div></div>
+                <div class="panel active"><div class="lbl">Active transfer</div><div class="row1"><span class="fname" id="aName">idle</span><span class="phase idle" id="aPhase">idle</span></div><div class="mini"><i id="aBar"></i></div><div class="meta" style="margin-top:10px"><span><b id="aBytes">0 B</b> / <span id="aTotal">0 B</span></span><span><b id="aSpeed">0 B/s</b></span></div><div class="eyes" id="eyes"></div></div>
               </div>
-
               <div class="stack">
                 <div class="panel">
                   <div class="lbl" style="margin-bottom:12px">RDP credentials <span style="color:var(--mut);text-transform:none;letter-spacing:0">(auto-filled by handler)</span></div>
@@ -594,89 +561,45 @@ jobs:
                   <div class="crow" data-k="pass"><span class="ck">PASS</span><code id="vPass">__PASS__</code><button class="cp" type="button">copy</button></div>
                   <a class="btn rdp" id="rdp" href="__GHRDP__">⚡ Open Remote Desktop (zero typing)</a>
                   <div class="hint" id="setupHint">RDP didn't open? Expand “First-time setup” below and run the connector once.</div>
-                  <details class="setup" id="setupBox">
-                    <summary><span class="ar">▶</span> First-time setup (one click, only if handler missing)</summary>
-                    <div class="body">
-                      The <b>ghrdp://</b> link auto-fills your password and opens RDP — but your browser needs the tiny connector installed <b>once</b>.<br>
-                      <a class="dl" href="/install.ps1" download>⬇ Download connector</a><br>
-                      Then right-click <b>ghrdp-install.ps1</b> → <b>Run with PowerShell</b>. If blocked, in PowerShell run:<br>
-                      <code>Set-ExecutionPolicy -Scope CurrentUser Bypass -Force</code><br>
-                      After it says SUCCESS, click <b>Open Remote Desktop</b> again. Tick <b>Always allow</b> on the browser prompt once.
-                    </div>
-                  </details>
+                  <details class="setup" id="setupBox"><summary><span class="ar">▶</span> First-time setup (one click, only if handler missing)</summary><div class="body">The <b>ghrdp://</b> link auto-fills your password and opens RDP — but your browser needs the tiny connector installed <b>once</b>.<br><a class="dl" href="/install.ps1" download>⬇ Download connector</a><br>Then right-click <b>ghrdp-install.ps1</b> → <b>Run with PowerShell</b>. If blocked, in PowerShell run:<br><code>Set-ExecutionPolicy -Scope CurrentUser Bypass -Force</code><br>After it says SUCCESS, click <b>Open Remote Desktop</b> again. Tick <b>Always allow</b> on the browser prompt once.</div></details>
                 </div>
-                <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div>
-                  <div class="stats">
-                    <div class="tile done"><div class="n" id="cDone">0</div><div class="k">done</div></div>
-                    <div class="tile act"><div class="n" id="cAct">0</div><div class="k">active</div></div>
-                    <div class="tile fail"><div class="n" id="cFail">0</div><div class="k">failed</div></div>
-                    <div class="tile trk"><div class="n" id="cTrk">0</div><div class="k">tracked</div></div>
-                  </div>
-                </div>
-                <div class="panel" id="mirrorBox" style="display:none">
-                  <div class="lbl" style="margin-bottom:12px">Mirror control</div>
-                  <button class="btn em" id="emBtn" type="button">⚡ Upload everything now</button>
-                  <div class="banner" id="banner"></div>
-                  <p style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:10px;line-height:1.6">Click it, wait for the green banner, <b style="color:var(--ink)">then</b> press Cancel workflow. A 2nd Cancel force-kills.</p>
-                </div>
+                <div class="panel"><div class="lbl" style="margin-bottom:12px">Counters</div><div class="stats"><div class="tile done"><div class="n" id="cDone">0</div><div class="k">done</div></div><div class="tile act"><div class="n" id="cAct">0</div><div class="k">active</div></div><div class="tile fail"><div class="n" id="cFail">0</div><div class="k">failed</div></div><div class="tile trk"><div class="n" id="cTrk">0</div><div class="k">tracked</div></div></div></div>
+                <div class="panel" id="mirrorBox" style="display:none"><div class="lbl" style="margin-bottom:12px">Mirror control</div><button class="btn em" id="emBtn" type="button">⚡ Upload everything now</button><div class="banner" id="banner"></div><p style="font-family:var(--mono);font-size:11px;color:var(--mut);margin-top:10px;line-height:1.6">Click it, wait for the green banner, <b style="color:var(--ink)">then</b> press Cancel workflow. A 2nd Cancel force-kills.</p></div>
               </div>
             </div>
-
             <div class="lower">
-              <div class="panel files">
-                <div class="lbl" style="margin-bottom:10px">File queue</div>
-                <div class="head"><span>status</span><span>file</span><span>progress</span><span>src</span></div>
-                <div class="flist" id="flist"><div class="empty">No files tracked yet.</div></div>
-              </div>
-              <div class="panel">
-                <div class="lbl" style="margin-bottom:10px">Live log</div>
-                <pre id="log">waiting for watcher…</pre>
-                <div class="code" id="rentry" style="display:none"></div>
-                <div id="diagBox"><div class="lbl" style="margin-bottom:8px">Diagnostics (rendered)</div><div class="verdict" id="diagOut"></div></div>
-              </div>
+              <div class="panel files"><div class="lbl" style="margin-bottom:10px">File queue</div><div class="head"><span>status</span><span>file</span><span>progress</span><span>src</span></div><div class="flist" id="flist"><div class="empty">No files tracked yet.</div></div></div>
+              <div class="panel"><div class="lbl" style="margin-bottom:10px">Live log</div><pre id="log">waiting for watcher…</pre><div class="code" id="rentry" style="display:none"></div><div id="diagBox"><div class="lbl" style="margin-bottom:8px">Diagnostics (rendered)</div><div class="verdict" id="diagOut"></div></div></div>
             </div>
           </div>
           <script>
           (function(){
             var STATIC=(document.getElementById('ghrdpStatic')||{}).content==='1';
             var currentGhrdp='__GHRDP__';
-            var D={pct:0,bDone:0};
             function fb(b){b=+b||0;if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
             function fe(rem,sp){sp=+sp||0;if(sp<=0||rem<=0)return '—';var s=rem/sp;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.round(s/60)+'m';return (s/3600).toFixed(1)+'h';}
-            function lerp(a,b){return a+(b-a)*0.18;}
-            function tick(){D.pct=lerp(D.pct,+(window.__PCT||0));D.bDone=lerp(D.bDone,+(window.__BDONE||0));document.getElementById('pct').textContent=Math.round(D.pct);document.getElementById('bDone').textContent=fb(D.bDone);document.getElementById('fill').style.width=Math.min(100,D.pct)+'%';requestAnimationFrame(tick);}
-            requestAnimationFrame(tick);
-            function clk(){var d=new Date();document.getElementById('clock').textContent=d.toTimeString().slice(0,8);}
-            setInterval(clk,1000);clk();
+            function tick(){/* smooth % via global set in render */requestAnimationFrame(tick);} requestAnimationFrame(tick);
+            function clk(){var d=new Date();document.getElementById('clock').textContent=d.toTimeString().slice(0,8);} setInterval(clk,1000);clk();
             function fallbackCopy(t){var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);}
             function copyBtn(btn,val){function ok(){btn.textContent='copied';btn.classList.add('done');setTimeout(function(){btn.textContent='copy';btn.classList.remove('done');},1200);}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(val).then(ok).catch(function(){fallbackCopy(val);ok();});}else{fallbackCopy(val);ok();}}
             document.querySelectorAll('.crow .cp').forEach(function(b){b.addEventListener('click',function(){var row=b.closest('.crow');var c=row?row.querySelector('code'):null;copyBtn(b,c?c.textContent:'');});});
-            // init baked creds into copy dataset (static view)
             ['ip','user','pass'].forEach(function(k){var row=document.querySelector('.crow[data-k="'+k+'"]');if(row){var c=row.querySelector('code');if(c)row.dataset.val=c.textContent;}});
-            function setGhrdp(u){currentGhrdp=u||currentGhrdp;var a=document.getElementById('ghrdpLink');var ok=!!currentGhrdp&&currentGhrdp.indexOf('ghrdp://')===0&&currentGhrdp.length>10;var r=document.getElementById('rdp');if(r){r.setAttribute('data-ok',ok?'1':'0');}}
-            function fireGhrdp(){var u=currentGhrdp;if(!u||u.indexOf('ghrdp://')!==0)return;try{var ifr=document.createElement('iframe');ifr.style.display='none';ifr.setAttribute('aria-hidden','true');ifr.src=u;document.body.appendChild(ifr);setTimeout(function(){try{ifr.remove();}catch(e){}},4000);}catch(e){}document.getElementById('setupHint').style.display='block';setTimeout(function(){var s=document.getElementById('setupBox');if(s&&!s.open){/* leave closed, hint shown */}},2500);}
+            function setGhrdp(u){currentGhrdp=u||currentGhrdp;var a=document.getElementById('ghrdpLink');var ok=!!currentGhrdp&&currentGhrdp.indexOf('ghrdp://')===0&&currentGhrdp.length>10;var r=document.getElementById('rdp');if(r){r.setAttribute('data-ok',ok?'1':'0');if(ok)r.href=currentGhrdp;}}
+            function fireGhrdp(){var u=currentGhrdp;if(!u||u.indexOf('ghrdp://')!==0)return;try{var ifr=document.createElement('iframe');ifr.style.display='none';ifr.setAttribute('aria-hidden','true');ifr.src=u;document.body.appendChild(ifr);setTimeout(function(){try{ifr.remove();}catch(e){}},4000);}catch(e){}document.getElementById('setupHint').style.display='block';}
             document.getElementById('rdp').addEventListener('click',function(e){e.preventDefault();fireGhrdp();});
-            function renderEyes(scan){
-              var box=document.getElementById('eyes');if(!box)return;
-              var keys=scan?Object.keys(scan):[];
-              if(!keys.length){box.innerHTML='<div class="lbl" style="margin-bottom:6px">Watcher eyes</div><div class="eye-row"><span class="t">no scan yet</span><span class="v">starting…</span></div>';return;}
-              var h='<div class="lbl" style="margin-bottom:6px">Watcher eyes (what it actually sees)</div>';
-              keys.forEach(function(k){var o=scan[k]||{};var cls='v';var txt='raw '+o.rawTotal+' / elig '+o.eligible;if(o.error){cls+=' bad';txt+=' · '+o.error;}else if(o.rawTotal>0&&o.eligible===0){cls+=' warn';txt+=' · in progress / filtered';}else if(o.rawTotal>0){cls+=' ok';}h+='<div class="eye-row"><span class="t">'+k+'</span><span class="'+cls+'">'+txt+'</span></div>';});
-              box.innerHTML=h;
-            }
+            function renderEyes(scan){var box=document.getElementById('eyes');if(!box)return;var keys=scan?Object.keys(scan):[];if(!keys.length){box.innerHTML='<div class="lbl" style="margin-bottom:6px">Watcher eyes</div><div class="eye-row"><span class="t">no scan yet</span><span class="v">starting…</span></div>';return;}var h='<div class="lbl" style="margin-bottom:6px">Watcher eyes (what it actually sees)</div>';keys.forEach(function(k){var o=scan[k]||{};var cls='v';var txt='raw '+o.rawTotal+' / elig '+o.eligible;if(o.error){cls+=' bad';txt+=' · '+o.error;}else if(o.rawTotal>0&&o.eligible===0){cls+=' warn';txt+=' · in progress / filtered';}else if(o.rawTotal>0){cls+=' ok';}h+='<div class="eye-row"><span class="t">'+k+'</span><span class="'+cls+'">'+txt+'</span></div>';});box.innerHTML=h;}
             function render(s){
               if(!s)return;
               var now=Date.now();var ts=s.ts?new Date(s.ts).getTime():0;var age=ts?Math.round((now-ts)/1000):999;
               var on=!s.mirror||(s.alive&&age<15);
               var al=document.getElementById('alive');al.className='pill'+(on?' on':'');document.getElementById('alivetxt').textContent=on?'online':(s.alive?'stale '+age+'s':'offline');
-              var md=document.getElementById('mode');if(STATIC){md.className='chip mode-funnel';md.textContent='⬈ local pc';}else{md.className='chip mode-loop';md.textContent='◉ inside rdp';}
               if(s.ghrdp){setGhrdp(s.ghrdp);}
               if(s.creds){['ip','user','pass'].forEach(function(k){var row=document.querySelector('.crow[data-k="'+k+'"]');if(row){var c=row.querySelector('code');var val=s.creds[k]||'-';if(c)c.textContent=val;row.dataset.val=val;}});}
               if(s.rentry){var r=document.getElementById('rentry');r.style.display='block';r.textContent='index: '+s.rentry;}
               document.getElementById('mirrorBox').style.display=s.mirror?'block':'none';
-              var a=s.agg||{};window.__PCT=a.overallPct||0;window.__BDONE=a.bytesDone||0;
-              document.getElementById('bTotal').textContent=fb(a.bytesTotal);document.getElementById('speed').textContent=fb(a.speedBps)+'/s';document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
+              var a=s.agg||{};document.getElementById('pct').textContent=a.overallPct||0;document.getElementById('fill').style.width=Math.min(100,a.overallPct||0)+'%';
               document.getElementById('cDone').textContent=a.done||0;document.getElementById('cAct').textContent=a.active||0;document.getElementById('cFail').textContent=a.failed||0;document.getElementById('cTrk').textContent=a.tracked||0;
+              document.getElementById('speed').textContent=fb(a.speedBps||0)+'/s';document.getElementById('bDone').textContent=fb(a.bytesDone||0);document.getElementById('bTotal').textContent=fb(a.bytesTotal||0);
               var ac=s.active||{};document.getElementById('aName').textContent=ac.name||'idle';var ph=document.getElementById('aPhase');ph.textContent=ac.phase||'idle';ph.className='phase '+(ac.phase||'idle');document.getElementById('aBar').style.width=(ac.pct||0)+'%';document.getElementById('aBytes').textContent=fb(ac.bytesDone);document.getElementById('aTotal').textContent=fb(ac.bytesTotal);document.getElementById('aSpeed').textContent=fb(ac.speedBps)+'/s';
               renderEyes(s.scan);
               var f=s.files||[];var fl=document.getElementById('flist');
@@ -686,23 +609,22 @@ jobs:
               var bn=document.getElementById('banner');bn.className='banner';
               if(s.mirror){if((a.failed||0)>0&&(a.active||0)===0){bn.className='banner warn';bn.textContent=(a.failed)+' file(s) failed — check log.';}else if((a.tracked||0)>0&&(a.active||0)===0&&(a.failed||0)===0&&(a.done||0)>0){bn.className='banner safe';bn.textContent='ALL UPLOADED — safe to Cancel workflow now.';}}
             }
-            function yn(v){return v?'<span class="ok">PASS</span>':'<span class="bad">FAIL</span>';}
             function runDiag(){
               var box=document.getElementById('diagBox');var out=document.getElementById('diagOut');box.style.display='block';out.innerHTML='running diagnostics…';
               Promise.all([fetch('/diag'+(location.search||''),{cache:'no-store'}).then(function(r){return r.json();}).catch(function(e){return {_err:String(e)};}),fetch('/progress'+(location.search||''),{cache:'no-store'}).then(function(r){return r.json();}).catch(function(e){return {_err:String(e)};})]).then(function(res){
                 var d=res[0]||{},p=res[1]||{};var L=[];
-                L.push('server cfgLoaded '+yn(d.cfgLoaded)+'  port7331 '+yn(d.portListening)+'  firewall '+yn(d.firewallRulePresent));
-                L.push('progressLoaded '+yn(d.progressLoaded)+(d.progressError?('  ('+d.progressError+')'):''));
-                L.push('request via loopback '+yn(d.requestLoopback)+'  host='+(d.requestHost||'-'));
+                L.push('server cfgLoaded '+(d.cfgLoaded?'<span class="ok">PASS</span>':'<span class="bad">FAIL</span>')+'  port7331 '+(d.portListening?'<span class="ok">PASS</span>':'<span class="bad">FAIL</span>')+'  firewall '+(d.firewallRulePresent?'<span class="ok">PASS</span>':'<span class="bad">FAIL</span>'));
+                L.push('progressLoaded '+(d.progressLoaded?'<span class="ok">PASS</span>':'<span class="bad">FAIL</span>')+(d.progressError?('  ('+d.progressError+')'):''));
+                L.push('request path : '+(d.requestLoopback?'loopback (inside RDP)':'tailnet serve (local pc) — expected')+'  host='+(d.requestHost||'-'));
                 var scan=p.scan||{};var keys=Object.keys(scan);
-                if(keys.length){L.push('');L.push('WATCHER EYES:');keys.forEach(function(k){var o=scan[k]||{};var line='  '+k+': raw='+o.rawTotal+' eligible='+o.eligible;if(o.error)line+='  -> <span class="bad">'+o.error+'</span>';else if(o.rawTotal>0&&o.eligible===0)line+='  -> <span class="warn">files present but not eligible (still downloading / incomplete / junk ext)</span>';else if(o.rawTotal>0)line+='  -> <span class="ok">will upload</span>';else line+='  -> folder empty';L.push(line);});}
+                if(keys.length){L.push('');L.push('WATCHER EYES:');keys.forEach(function(k){var o=scan[k]||{};var line='  '+k+': raw='+o.rawTotal+' eligible='+o.eligible;if(o.error)line+='  -> <span class="bad">'+o.error+'</span>';else if(o.rawTotal>0&&o.eligible===0)line+='  -> <span class="warn">files present but not eligible (still downloading / incomplete / filtered)</span>';else if(o.rawTotal>0)line+='  -> <span class="ok">will upload</span>';else line+='  -> folder empty / not found';L.push(line);});}
                 var agg=p.agg||{};L.push('');L.push('tracked='+(agg.tracked||0)+' done='+(agg.done||0)+' active='+(agg.active||0)+' failed='+(agg.failed||0));
                 var verdict;
                 if(d._err){verdict='<span class="bad">server unreachable: '+d._err+'</span>';}
                 else if(keys.length&&keys.some(function(k){return (scan[k]||{}).rawTotal>0&&(scan[k]||{}).eligible>0;})){verdict='<span class="ok">UPLOADING / HEALTHY</span> — files detected and processing.';}
                 else if(keys.length&&keys.some(function(k){var o=scan[k]||{};return o.rawTotal>0&&o.eligible===0&&!o.error;})){verdict='<span class="warn">FILES PRESENT BUT NOT ELIGIBLE</span> — likely still downloading (incomplete) or filtered extension. Wait for completion; watcher auto-picks them up.';}
-                else if(keys.length&&keys.some(function(k){return (scan[k]||{}).error;})){verdict='<span class="bad">PATH/PERMISSION ERROR</span> — see eyes above. The watcher auto-creates profile folders; if your files are in a custom qBittorrent path, it is auto-discovered.';}
-                else if(keys.length){verdict='<span class="warn">WATCHER ALIVE</span> but watched folders are empty — drop a file into Downloads / Desktop / D:\\RDP-Storage inside RDP.';}
+                else if(keys.length&&keys.some(function(k){return (scan[k]||{}).error;})){verdict='<span class="bad">PATH/PERMISSION ERROR</span> — see eyes above (the watcher now resolves the real Downloads path incl. OneDrive; check the listed paths).';}
+                else if(keys.length){verdict='<span class="warn">WATCHER ALIVE</span> but watched folders empty — drop a file into Downloads / Desktop / D:\\RDP-Storage inside RDP.';}
                 else {verdict='<span class="warn">NO SCAN YET</span> — watcher starting; refresh in a few seconds.';}
                 L.push('');L.push('>>> VERDICT: '+verdict);
                 out.innerHTML=L.join('\n');
@@ -710,21 +632,19 @@ jobs:
             }
             document.getElementById('diagBtn').addEventListener('click',runDiag);
             document.getElementById('emBtn').addEventListener('click',function(){var b=this;b.disabled=true;b.textContent='triggered…';fetch('/emergency'+(location.search||''),{cache:'no-store'}).then(function(){setTimeout(function(){b.disabled=false;b.textContent='⚡ Upload everything now';},1500);}).catch(function(){b.disabled=false;b.textContent='⚡ Upload everything now';});});
-            function poll(){fetch('/progress'+(location.search||''),{cache:'no-store'}).then(function(r){return r.json();}).then(render).catch(function(){});}
-            if(STATIC){
-              // local-pc static view: render baked values once, NO polling, NO auto-navigate; DIAGNOSE works on demand
-              render({mirror:false,ghrdp:currentGhrdp,creds:{ip:document.getElementById('vIp').textContent,user:document.getElementById('vUser').textContent,pass:document.getElementById('vPass').textContent},viaLoopback:false,alive:true,ts:new Date().toISOString()});
-              document.getElementById('mode').className='chip mode-funnel';document.getElementById('mode').textContent='⬈ local pc (click Open RDP)';
-            }else{
-              poll();setInterval(poll,1500);
-            }
+            // ---- unified guarded live polling (works on local pc too; in-flight guard prevents abort floods) ----
+            var __inflight=false;
+            function pollOnce(){if(__inflight)return;__inflight=true;fetch('/progress'+(location.search||''),{cache:'no-store'}).then(function(r){return r.json();}).then(function(s){render(s);}).catch(function(){}).then(function(){__inflight=false;});}
+            render({mirror:false,ghrdp:currentGhrdp,creds:{ip:document.getElementById('vIp').textContent,user:document.getElementById('vUser').textContent,pass:document.getElementById('vPass').textContent},viaLoopback:!STATIC,alive:true,ts:new Date().toISOString()});
+            if(STATIC){document.getElementById('mode').className='chip mode-funnel';document.getElementById('mode').textContent='⬈ local pc (live)';}else{document.getElementById('mode').className='chip mode-loop';document.getElementById('mode').textContent='◉ inside rdp (live)';}
+            pollOnce();setInterval(pollOnce,3000);
           })();
           </script>
           </body>
           </html>
           UIEOF
 
-      - name: Write mirror watcher script (auto-create roots + qBittorrent discovery + resilient loop + structured scan)
+      - name: Write mirror watcher script
         if: ${{ github.event.inputs.mirror_downloads_public == 'true' }}
         shell: bash
         run: |
@@ -745,15 +665,38 @@ jobs:
           $script:RUNLOG = New-Object System.Collections.ArrayList; $script:SCAN = @{}
           function LErr($t, $e) { $m = ("[{0}] {1}: {2}" -f (Get-Date -f 'HH:mm:ss'), $t, $e.Exception.Message); [void]$script:RUNLOG.Add($m); try { if ($global:GHRDP_PROG -and $global:GHRDP_PROG.log) { $global:GHRDP_PROG.log = @($global:GHRDP_PROG.log) + $m } } catch {}; try { Add-Content $cfg.logFile $m -ErrorAction SilentlyContinue } catch {} }
           function ScanLine { $parts = @($script:SCAN.GetEnumerator() | ForEach-Object { $v = $_.Value; $s = $_.Key + ':raw=' + $v.rawTotal + '/elig=' + $v.eligible; if ($v.rawSamples -and $v.rawSamples.Count) { $s += ' :: ' + ($v.rawSamples -join ', ') }; if ($v.error) { $s += ' ERR=' + $v.error }; $s }); return ('[scan] ' + ($parts -join ' | ')) }
-          function Add-Root($list, $path, $tag, $rec, $min) { if (-not $path) { return $list }; $p = $path.TrimEnd('\'); foreach ($r in $list) { if ($r.path.TrimEnd('\') -eq $p) { return $list } }; $list += @{ path = $p; tag = $tag; rec = $rec; min = $min }; return $list }
-          # build augmented root list: configured + standard profile folders + qBittorrent discovered paths
-          $roots = @(); foreach ($r in $cfg.roots) { $roots = Add-Root $roots $r.path $r.tag ([bool]$r.rec) ([long]$r.min) }
-          $prof = $env:USERPROFILE
-          foreach ($sub in @('Downloads', 'Desktop', 'Documents')) { $fp = Join-Path $prof $sub; try { New-Item -ItemType Directory -Path $fp -Force -ErrorAction SilentlyContinue | Out-Null } catch {}; $roots = Add-Root $roots $fp $sub $false 0 }
-          $tempP = Join-Path $env:LOCALAPPDATA 'Temp'; try { New-Item -ItemType Directory -Path $tempP -Force -ErrorAction SilentlyContinue | Out-Null } catch {}; $roots = Add-Root $roots $tempP 'Temp' $true 102400
+          # ---- root builder: resolves the REAL Downloads/Desktop/Documents (handles OneDrive / Known-Folder redirection) ----
+          function Add-Root($list, $path, $tag, $rec, $min) { if (-not $path) { return $list }; $p = $path.TrimEnd('\'); if (-not $p) { return $list }; foreach ($r in $list) { if ($r.path.TrimEnd('\').ToLower() -eq $p.ToLower()) { return $list } }; $list += @{ path = $p; tag = $tag; rec = [bool]$rec; min = [long]$min }; return $list }
+          function Resolve-ShellContentDirs {
+            $res = New-Object System.Collections.ArrayList
+            $guids = @{ Downloads = @('{374DE290-123F-45C5-91F6-3D0D0A7C3D2D}', '{7D83EE9B-2244-4E70-B1F5-5393042AF1E4}'); Desktop = @('{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}'); Documents = @('{FDD39AD0-238F-46AF-ADB4-6C85480369C7}', '{24D89E24-2F19-4534-9DDE-6A6671FBB8FE}') }
+            $friendly = @{ Desktop = 'Desktop'; Documents = 'Personal' }
+            $keys = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
+            foreach ($tag in 'Downloads', 'Desktop', 'Documents') {
+              $found = $null
+              foreach ($k in $keys) {
+                if (-not (Test-Path $k)) { continue }; $props = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue; if (-not $props) { continue }
+                foreach ($gn in $guids[$tag]) { $v = $props.$gn; if ($v -and $v -is [string]) { $p = [Environment]::ExpandEnvironmentVariables($v); if ($p -and (Test-Path -LiteralPath $p -PathType Container)) { $found = $p; break } } }
+                if (-not $found) { $fn = $friendly[$tag]; if ($fn) { $v = $props.$fn; if ($v -and $v -is [string]) { $p = [Environment]::ExpandEnvironmentVariables($v); if ($p -and (Test-Path -LiteralPath $p -PathType Container)) { $found = $p } } } }
+                if ($found) { break }
+              }
+              if ($found) { [void]$res.Add(@{ tag = $tag; path = $found }) }
+            }
+            return $res
+          }
+          $roots = @(); foreach ($r in $cfg.roots) { $roots = Add-Root $roots $r.path $r.tag $r.rec $r.min }
+          $home_ = $env:USERPROFILE
+          $cands = @()
+          $cands += , @{ tag = 'Downloads'; path = (Join-Path $home_ 'Downloads') }
+          $cands += , @{ tag = 'Desktop';   path = (Join-Path $home_ 'Desktop') }
+          $cands += , @{ tag = 'Documents'; path = (Join-Path $home_ 'Documents') }
+          foreach ($base in @((Join-Path $home_ 'OneDrive'), $env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)) { if ($base) { foreach ($sub in 'Downloads', 'Desktop', 'Documents') { $cands += , @{ tag = $sub; path = (Join-Path $base $sub) } } } }
+          foreach ($c in $cands) { try { New-Item -ItemType Directory -Path $c.path -Force -ErrorAction SilentlyContinue | Out-Null } catch {}; if (Test-Path -LiteralPath $c.path -PathType Container) { $roots = Add-Root $roots $c.path $c.tag $false 0 } }
+          foreach ($c in (Resolve-ShellContentDirs)) { $roots = Add-Root $roots $c.path $c.tag $false 0 }
           $qini = Join-Path $env:APPDATA 'qBittorrent\qBittorrent.ini'
-          if (Test-Path $qini) { $qtxt = Get-Content $qini -Raw -ErrorAction SilentlyContinue; if ($qtxt) { if ($qtxt -match '(?m)^\s*SavePath\s*=\s*(.+)$') { $roots = Add-Root $roots $Matches[1].Trim() 'qB-Save' $true 0 }; if ($qtxt -match '(?m)^\s*TempPath\s*=\s*(.+)$') { $roots = Add-Root $roots $Matches[1].Trim() 'qB-Temp' $true 0 } } }
-          Write-HB ('watcher lib loaded - roots=' + ($roots | ForEach-Object { $_.tag }) -join ',')
+          if (Test-Path $qini) { $qtxt = Get-Content $qini -Raw -ErrorAction SilentlyContinue; if ($qtxt) { if ($qtxt -match '(?m)^\s*SavePath\s*=\s*(.+)$') { $roots = Add-Root $roots $Matches[1].Trim() 'qB-Save' $true 0 }; if ($qtxt -match '(?m)^\s*TempPath\s*=\s*(.+)$') { $roots = Add-Root $roots $Matches[1].Trim() 'qB-Temp' $true 102400 } } }
+          $tempP = Join-Path $env:LOCALAPPDATA 'Temp'; try { New-Item -ItemType Directory -Path $tempP -Force -ErrorAction SilentlyContinue | Out-Null } catch {}; $roots = Add-Root $roots $tempP 'Temp' $true 102400
+          Write-HB ('watcher roots(' + $roots.Count + ')=' + (($roots | ForEach-Object { $_.tag + '=' + $_.path }) -join ' | '))
           $junk = @('.tmp', '.crdownload', '.partial', '.lock', '.log', '.etl', '.pf', '.db-journal', '.sqlite-journal', '.old', '.bak', '.!qb')
           $done = @{}; if (Test-Path $cfg.doneFile) { Get-Content $cfg.doneFile | ForEach-Object { $done[$_] = $true } }
           $idx = Load-Index $cfg
@@ -775,13 +718,13 @@ jobs:
           function Proc($fi, $tag) { if ($done.ContainsKey($fi.FullName)) { return }; DoUpload $fi $tag }
           function Scan($r) {
             $elig = 0; $esamp = New-Object System.Collections.ArrayList; $rawAll = @(); $rerr = ''
-            if (-not (Test-Path $r.path)) { try { New-Item -ItemType Directory -Path $r.path -Force -ErrorAction SilentlyContinue | Out-Null } catch {}; if (-not (Test-Path $r.path)) { $script:SCAN[$r.tag] = @{ rawTotal = 0; eligible = 0; path = $r.path; error = 'path-missing'; rawSamples = @() }; return } }
+            if (-not (Test-Path $r.path)) { $script:SCAN[$r.tag] = @{ rawTotal = 0; eligible = 0; path = $r.path; error = 'path-missing'; rawSamples = @() }; return }
             try { $items = if ($r.rec) { Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue } else { Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue } } catch { $script:SCAN[$r.tag] = @{ rawTotal = -1; eligible = 0; path = $r.path; error = $_.Exception.Message; rawSamples = @() }; return }
             $rawAll = @($items); $rawNames = @($rawAll | Select-Object -First 4 | ForEach-Object { $_.Name })
-            foreach ($fi in $rawAll) { if ($done.ContainsKey($fi.FullName)) { continue }; if ($junk -contains $fi.Extension.ToLower()) { continue }; if ($fi.Length -lt $r.min) { continue }; if ($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)') { continue }; $elig++; if ($esamp.Count -lt 6) { [void]$esamp.Add(($fi.Name + ' (' + [math]::Round($fi.Length / 1MB, 1) + 'MB)')) }; Proc $fi $tag }
+            foreach ($fi in $rawAll) { if ($done.ContainsKey($fi.FullName)) { continue }; if ($junk -contains $fi.Extension.ToLower()) { continue }; if ($fi.Length -lt $r.min) { continue }; if ($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)') { continue }; $elig++; if ($esamp.Count -lt 6) { [void]$esamp.Add(($fi.Name + ' (' + [math]::Round($fi.Length / 1MB, 1) + 'MB)')) }; Proc $fi $r.tag }
             $script:SCAN[$r.tag] = @{ rawTotal = $rawAll.Count; eligible = $elig; path = $r.path; error = $rerr; rawSamples = $rawNames; eligibleSamples = @($esamp) }
           }
-          function SweepAll($r) { if (-not (Test-Path $r.path)) { return }; $items = if ($r.rec) { Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Sort-Object Length -Descending } else { Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending }; foreach ($fi in $items) { if ($done.ContainsKey($fi.FullName)) { continue }; if ($junk -contains $fi.Extension.ToLower()) { continue }; if ($fi.Length -lt $r.min) { continue }; if ($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)') { continue }; DoUpload $fi $tag } }
+          function SweepAll($r) { if (-not (Test-Path $r.path)) { return }; $items = if ($r.rec) { Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Sort-Object Length -Descending } else { Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending }; foreach ($fi in $items) { if ($done.ContainsKey($fi.FullName)) { continue }; if ($junk -contains $fi.Extension.ToLower()) { continue }; if ($fi.Length -lt $r.min) { continue }; if ($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)') { continue }; DoUpload $fi $r.tag } }
           function EmergencyPass {
             "[$(Get-Date -f o)] EMERGENCY pass start" | Out-File $cfg.logFile -Append
             foreach ($p in @('qbittorrent', 'qbittorrent-nox')) { Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
@@ -801,9 +744,7 @@ jobs:
               $p.log = @($errs) + @(ScanLine) + $filetail; Flush-Progress $true
             } catch { LErr 'sync-err' $_ }
           }
-          $iter = 0
           while ($true) {
-            $iter++
             if (Test-Path $cfg.emergencyFlag) { try { EmergencyPass } catch { LErr 'emergency-err' $_ } }
             else { foreach ($r in $roots) { try { Scan $r } catch { LErr ('scan-err ' + $r.tag) $_ } }; if (Test-Path $cfg.flushFlag) { try { "[$(Get-Date -f o)] FLUSH seen" | Out-File $cfg.logFile -Append; for ($p = 0; $p -lt 8; $p++) { foreach ($r in $roots) { Scan $r }; if (-not ($idx | Where-Object { $_.status -ne 'ok' })) { break }; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx) | Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue } catch { LErr 'flush-err' $_ } } }
             SyncProg
