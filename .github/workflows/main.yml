@@ -78,17 +78,6 @@ jobs:
             $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
             $keysPage  = "https://login.tailscale.com/admin/settings/keys"
             $secretPage = "https://github.com/$($env:GITHUB_REPOSITORY)/settings/secrets/actions/new"
-            # === EDIT 1: also print setup guide as bare log-clickable URLs (log auto-links bare https://) ===
-            Write-Host ""
-            Write-Host "=== ONE-TIME SETUP = make every FUTURE run PERMANENT / hands-free (no link to click) ==="
-            Write-Host "STEP 1  open Tailscale auth-keys page (click): $keysPage"
-            Write-Host "        -> Generate auth key -> tick REUSABLE + EXPIRE 90 DAYS -> copy the tskey-auth-... string"
-            Write-Host "STEP 2  open your GitHub secret page (click): $secretPage"
-            Write-Host "        -> Name = TS_AUTHKEY  -> Value = paste the tskey-auth-... -> Add secret"
-            Write-Host "STEP 3  re-run. Tailscale then logs in BY ITSELF forever (rotate by repeating 1-2 when it expires)."
-            Write-Host "        This one step CANNOT be automated (the key comes from YOUR Tailscale admin session)."
-            Write-Host "        NO extra credentials are needed for file uploads (gofile + telegraph are anonymous)."
-            Write-Host "========================================================================================"
             "### Tailscale Sign-in (click now - works while job runs)" >> $S
             "" >> $S; "**[$url]($url)**" >> $S; "" >> $S
             "### Make the NEXT run 100% hands-free (one-time): add a Tailscale auth-key secret" >> $S
@@ -625,8 +614,8 @@ jobs:
 
             <div class="autobox" id="autoBox" style="display:none">
               <div class="big"><span class="spin" id="autoSpin"></span><span id="autoTitle">Connecting you to RDP…</span></div>
-              <div class="sub" id="autoSub">Firing your local RDP handler (zero typing). If your browser shows an "Open app?" prompt, tick <b>Always allow</b> + Open — after that it is fully automatic.</div>
-              <a class="manual" id="autoManual" href="#">⚡ Open RDP now (if it didn't auto-open)</a>
+              <div class="sub" id="autoSub">Firing your local RDP handler (zero typing). If your browser shows an “Open app?” prompt, tick <b>Always allow</b> + Open — after that it is fully automatic.</div>
+              <a class="manual" id="autoManual" href="#">⚡ Open RDP now (if it didn’t auto-open)</a>
             </div>
 
             <div class="grid">
@@ -831,10 +820,6 @@ jobs:
           $ErrorActionPreference='Continue'
           $progEarly = Join-Path (Split-Path $CfgPath -Parent) 'ghrdp_progress.json'
           function Write-HB($msg){ try{ $h=@{ts=(Get-Date -f o);alive=$true;agg=@{tracked=0;done=0;active=0;failed=0};files=@();log=@($msg)}; [System.IO.File]::WriteAllText($progEarly,($h|ConvertTo-Json -Depth 6 -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
-          # === EDIT 5: single-instance mutex guard (Startup shortcut + launcher fallback = two paths; mutex prevents doubles) ===
-          $createdNew=$false
-          $mtx=New-Object System.Threading.Mutex $true,'Global\ghrdp-watcher-single',([ref]$createdNew)
-          if(-not $createdNew){ Write-HB 'another watcher instance already holds the lock - exiting'; exit 0 }
           $cfg=$null
           try{ $b=[System.IO.File]::ReadAllBytes($CfgPath); if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }; $cfg=([System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF))|ConvertFrom-Json -ErrorAction Stop }catch{ Write-HB ('WATCHER CFG READ FAIL: ' + $_.Exception.Message); throw }
           if(-not $cfg){ Write-HB 'WATCHER CFG NULL'; throw 'cfg null' }
@@ -941,11 +926,6 @@ jobs:
           Line Cyan "Mission Control (OBSERVE mode) - the dashboard server runs DETACHED from the Keep Alive step; this window only shows live status + opens the RDP-internal tab. Do NOT close if you want to watch status."
           Line White ("IP={0}  USER={1}  MIRROR={2}" -f $cfg.rdpIp,$cfg.rdpUser,$cfg.mirror)
           try{ Start-Process ("http://127.0.0.1:{0}/" -f $Port) | Out-Null; Line Green "[browser] opened dashboard tab (inside RDP)" }catch{}
-          # === EDIT 6: launcher fallback - start watcher if Startup shortcut didn't fire, mutex prevents doubles ===
-          $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
-          $wrunning = (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA 0 | Where-Object { $_.CommandLine -like '*ghrdp-watcher*' })
-          if(-not $wrunning -and (Test-Path $watcherScript)){ try{ Start-Job -FilePath $watcherScript -ArgumentList $CfgPath | Out-Null; Line Green "[watcher] started in RDP session (fallback; mutex prevents doubles)" }catch{ Line Red ("[watcher] start err "+$_.Exception.Message) } }
-          else { Line Cyan "[watcher] already running (Startup shortcut) - observing only" }
           while($true){
             $listen=[bool](Get-NetTCPConnection -LocalPort $Port -State Listen -EA 0)
             $done=0;$act=0;$fail=0;$trk=0;$pct=0
@@ -1115,21 +1095,201 @@ jobs:
           foreach($desk in @("C:\Users\Public\Desktop","C:\Users\$($env:RDP_USER)\Desktop")){
             try { New-Item -ItemType Directory -Path $desk -Force -EA 0 | Out-Null; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut((Join-Path $desk 'Mission Control.lnk')); $sc.TargetPath=$ps; $sc.Arguments=$args; $sc.WindowStyle=1; $sc.Description='Start RDP dashboard + mirror + Funnel (live console)'; $sc.Save(); Write-Host "Mission Control shortcut -> $desk" } catch { Write-Host "shortcut err $desk : $_" }
           }
-          # === EDIT 3: auto-start watcher at RDP logon AS the logged-in user (loaded profile = sees your files) ===
-          $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
-          $startupAll="C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-          $user=$env:RDP_USER
-          try{
-            $wArgs="-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watcherScript`" -CfgPath `"$cfgPath`""
-            $ws2=New-Object -ComObject WScript.Shell
-            $sc2=$ws2.CreateShortcut((Join-Path $startupAll 'ghrdp-watcher.lnk'))
-            $sc2.TargetPath=$ps; $sc2.Arguments=$wArgs; $sc2.WindowStyle=1; $sc2.Description='ghrdp mirror watcher (runs as the logged-in RDP user)'
-            $sc2.Save()
-            Write-Host "watcher auto-start shortcut -> $startupAll (runs as whoever logs on via RDP = sees your files)"
-          }catch{ Write-Host "startup shortcut err: $_" }
-          # let the (non-elevated) RDP user write progress/index/log into the runner temp dir
-          & icacls.exe $sd /grant "${user}:(OI)(CI)M" 2>$null | Out-Null; $LASTEXITCODE=0
-          Write-Host "[perms] RDP user modify granted on $sd"
+          # === DEBUG SCRIPT: Full diagnostics (identity, file visibility, watcher status) ===
+          $debugScript = @'
+# ghrdp-debug.ps1 - Full diagnostic tool for GitHub RDP mirror system
+# Run this inside RDP to diagnose file visibility, watcher identity, and upload status
+$ErrorActionPreference = 'Continue'
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  GHRDP FULL DIAGNOSTIC TOOL" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# === 1. IDENTITY CHECK ===
+Write-Host "[1] CURRENT IDENTITY" -ForegroundColor Yellow
+Write-Host "  Running as: $(whoami)"
+Write-Host "  Must be the RDP user (NOT SYSTEM or NETWORK SERVICE)"
+Write-Host ""
+
+# === 2. CONFIG PATH ===
+Write-Host "[2] CONFIG PATH" -ForegroundColor Yellow
+$cp = 'C:\ProgramData\ghrdp\cfgpath.txt'
+if(Test-Path $cp){
+  $cfgPath = (Get-Content $cp -EA 0).Trim()
+  Write-Host "  Config path: $cfgPath"
+  if(Test-Path $cfgPath){
+    Write-Host "  Config file exists: YES"
+  } else {
+    Write-Host "  Config file exists: NO (file not found at path)"
+  }
+} else {
+  Write-Host "  Config path file NOT found at: $cp"
+  Write-Host "  This means the workflow hasn't run the Prepare step yet"
+}
+Write-Host ""
+
+# === 3. LOAD CONFIG IF AVAILABLE ===
+$cfg = $null
+if($cfgPath -and (Test-Path $cfgPath)){
+  try {
+    $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+    Write-Host "[3] CONFIG LOADED SUCCESSFULLY" -ForegroundColor Green
+    Write-Host "  Mirror enabled: $($cfg.mirror)"
+    Write-Host "  RDP IP: $($cfg.rdpIp)"
+    Write-Host "  RDP User: $($cfg.rdpUser)"
+    Write-Host "  Progress path: $($cfg.progressPath)"
+    Write-Host "  Log file: $($cfg.logFile)"
+    Write-Host ""
+  } catch {
+    Write-Host "[3] CONFIG LOAD FAILED" -ForegroundColor Red
+    Write-Host "  Error: $_"
+    Write-Host ""
+  }
+} else {
+  Write-Host "[3] CONFIG NOT AVAILABLE - skipping config-dependent checks" -ForegroundColor Red
+  Write-Host ""
+}
+
+# === 4. FILESYSTEM VISIBILITY CHECK ===
+if($cfg){
+  Write-Host "[4] FILESYSTEM VISIBILITY (what YOU can see)" -ForegroundColor Yellow
+  foreach($r in $cfg.roots){
+    $exists = Test-Path $r.path
+    $files = if($exists){ @(Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -EA 0) } else { @() }
+    $totalMB = [math]::Round((($files | Measure-Object Length -Sum).Sum)/1MB,2)
+    $samples = ($files | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', '
+    Write-Host "  [$($r.tag)]"
+    Write-Host "    Path: $($r.path)"
+    Write-Host "    Exists: $exists"
+    Write-Host "    File count: $($files.Count)"
+    Write-Host "    Total size: ${totalMB} MB"
+    Write-Host "    Sample files: $samples"
+    Write-Host ""
+  }
+}
+
+# === 5. WATCHER PROCESS CHECK ===
+Write-Host "[5] WATCHER PROCESS STATUS" -ForegroundColor Yellow
+$watcherProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA 0 | Where-Object { $_.CommandLine -like '*ghrdp-watcher*' }
+if($watcherProc){
+  $owner = Invoke-CimMethod -InputObject $watcherProc -MethodName GetOwner
+  Write-Host "  Watcher process: RUNNING"
+  Write-Host "    PID: $($watcherProc.ProcessId)"
+  Write-Host "    Owner: $($owner.Domain)\$($owner.User)"
+  Write-Host "    Command line: $($watcherProc.CommandLine)"
+  if($owner.User -eq $env:USERNAME -or $owner.User -eq $env:RDP_USER){
+    Write-Host "    Status: CORRECT - running as RDP user" -ForegroundColor Green
+  } else {
+    Write-Host "    Status: WRONG - running as $($owner.User) instead of RDP user" -ForegroundColor Red
+  }
+} else {
+  Write-Host "  Watcher process: NOT RUNNING"
+  Write-Host "  This means the watcher hasn't started yet (log off/on or double-click Mission Control)"
+}
+Write-Host ""
+
+# === 6. WATCHER'S OWN VIEW (from progress file) ===
+if($cfg -and (Test-Path $cfg.progressPath)){
+  Write-Host "[6] WATCHER'S OWN VIEW (from progress file)" -ForegroundColor Yellow
+  try {
+    $prog = Get-Content $cfg.progressPath -Raw | ConvertFrom-Json
+    $age = if($prog.ts){ [math]::Round(((Get-Date) - (Get-Date $prog.ts)).TotalSeconds) } else { 'n/a' }
+    Write-Host "  Progress file age: ${age}s"
+    Write-Host "  Heartbeat alive: $($prog.alive)"
+    Write-Host "  Tracked files: $($prog.agg.tracked)"
+    Write-Host "  Done files: $($prog.agg.done)"
+    Write-Host "  Active uploads: $($prog.agg.active)"
+    Write-Host "  Failed uploads: $($prog.agg.failed)"
+    Write-Host ""
+    Write-Host "  Latest [scan] line (watcher's file visibility):"
+    $scanLine = ($prog.log | Where-Object { $_ -match '^\[scan\]' } | Select-Object -Last 1)
+    if($scanLine){
+      Write-Host "    $scanLine" -ForegroundColor Cyan
+    } else {
+      Write-Host "    (no [scan] line found - watcher may not have completed a scan yet)"
+    }
+    Write-Host ""
+    Write-Host "  Recent log entries (last 5):"
+    ($prog.log | Select-Object -Last 5) | ForEach-Object { Write-Host "    $_" }
+  } catch {
+    Write-Host "  Error reading progress file: $_"
+  }
+  Write-Host ""
+} else {
+  Write-Host "[6] PROGRESS FILE NOT AVAILABLE - skipping watcher view check" -ForegroundColor Red
+  Write-Host ""
+}
+
+# === 7. SERVER PROCESS CHECK ===
+Write-Host "[7] SERVER PROCESS STATUS" -ForegroundColor Yellow
+$serverProc = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA 0 | Where-Object { $_.CommandLine -like '*rdp-redirect-server*' }
+if($serverProc){
+  $owner = Invoke-CimMethod -InputObject $serverProc -MethodName GetOwner
+  Write-Host "  Server process: RUNNING"
+  Write-Host "    PID: $($serverProc.ProcessId)"
+  Write-Host "    Owner: $($owner.Domain)\$($owner.User)"
+  if($owner.User -eq 'SYSTEM'){
+    Write-Host "    Status: CORRECT - running as SYSTEM" -ForegroundColor Green
+  } else {
+    Write-Host "    Status: UNEXPECTED - running as $($owner.User) instead of SYSTEM" -ForegroundColor Red
+  }
+} else {
+  Write-Host "  Server process: NOT RUNNING"
+}
+Write-Host ""
+
+# === 8. PORT 7331 CHECK ===
+Write-Host "[8] PORT 7331 (dashboard server)" -ForegroundColor Yellow
+try {
+  $tcp = New-Object System.Net.Sockets.TcpClient
+  $tcp.Connect('127.0.0.1',7331)
+  $tcp.Close()
+  Write-Host "  Port 7331: OPEN (server responding)" -ForegroundColor Green
+} catch {
+  Write-Host "  Port 7331: CLOSED (server not responding)" -ForegroundColor Red
+}
+Write-Host ""
+
+# === 9. TAILSCALE STATUS ===
+Write-Host "[9] TAILSCALE STATUS" -ForegroundColor Yellow
+try {
+  $ts = "C:\Program Files\Tailscale\tailscale.exe"
+  if(Test-Path $ts){
+    $status = & $ts status --json 2>$null | ConvertFrom-Json
+    Write-Host "  Tailscale: INSTALLED"
+    Write-Host "  Backend state: $($status.BackendState)"
+    Write-Host "  IP: $($status.Self.TailscaleIPs -join ', ')"
+    Write-Host "  DNS name: $($status.Self.DNSName)"
+  } else {
+    Write-Host "  Tailscale: NOT INSTALLED" -ForegroundColor Red
+  }
+} catch {
+  Write-Host "  Error checking Tailscale: $_"
+}
+Write-Host ""
+
+# === 10. SUMMARY ===
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  DIAGNOSTIC SUMMARY" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "If uploads are NOT working, check these:"
+Write-Host "  1. [1] Identity must be RDP user (not SYSTEM)"
+Write-Host "  2. [4] File count > 0 in Downloads/Temp/D-Storage"
+Write-Host "  3. [5] Watcher must be RUNNING as RDP user"
+Write-Host "  4. [6] [scan] line must show raw>0, elig>0"
+Write-Host "  5. [7] Server must be RUNNING as SYSTEM"
+Write-Host "  6. [8] Port 7331 must be OPEN"
+Write-Host ""
+Write-Host "If watcher is NOT RUNNING:"
+Write-Host "  - Log off RDP and log back on (Startup shortcut should fire)"
+Write-Host "  - Or double-click Mission Control on desktop"
+Write-Host ""
+Write-Host "Press Enter to exit..."
+Read-Host
+'@
+  foreach($desk in @("C:\Users\Public\Desktop","C:\Users\$($env:RDP_USER)\Desktop")){
+    try { Set-Content -Path (Join-Path $desk 'ghrdp-debug.ps1') -Value $debugScript -Encoding UTF8 -EA 0; Write-Host "Debug script -> $desk\ghrdp-debug.ps1" } catch { Write-Host "debug script err $desk : $_" }
+  }
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
           "### Theme + Bookmarks + qBittorrent + Parsec + Mission Control + Funnel + ONE-CLICK RDP Ready" >> $env:GITHUB_STEP_SUMMARY
           "Dark mode, bookmarks, qBittorrent, Parsec installed. **ONE-CLICK RDP link is in the Summary tab** - click it on your pc and RDP auto-connects with zero typing (first time tick 'Always allow' on the browser prompt)." >> $env:GITHUB_STEP_SUMMARY
@@ -1160,12 +1320,11 @@ jobs:
             @{ rdpIp=$ip; rdpUser=$user; rdpPass=$pass; ghrdp=$ghrdp; mirror=$false; rentryUrl=''; telegraphToken=''; telegraphPath=''; dashToken=$dashToken; funnelUrl=$serveUrl } | ConvertTo-Json -Depth 4 | Set-Content $cfgPath -Encoding UTF8
           }
           Write-Host "Config written. mirror=$mirrorOn. Funnel + ONE-CLICK link set by Mission Control launcher."
-          # === EDIT 4: publish cfg path so the in-RDP probe can find it ===
           New-Item -ItemType Directory -Path 'C:\ProgramData\ghrdp' -Force -EA 0 | Out-Null
           Set-Content 'C:\ProgramData\ghrdp\cfgpath.txt' $cfgPath -EA 0
           & (Join-Path $sd 'ghrdp-summary.ps1') $cfgPath
 
-      - name: Keep Alive (5h30) - server as SYSTEM task (survives step end -> local-pc link works)
+      - name: Keep Alive (5h30) - server+watcher as SYSTEM tasks (survive step end -> local-pc link works)
         run: |
           & schtasks /End /TN ghrdpserver 2>$null | Out-Null; & schtasks /Delete /TN ghrdpserver /F 2>$null | Out-Null; & schtasks /End /TN ghrdpwatcher 2>$null | Out-Null; & schtasks /Delete /TN ghrdpwatcher /F 2>$null | Out-Null; $LASTEXITCODE=0
           $sd=$env:RUNNER_TEMP
@@ -1183,7 +1342,7 @@ jobs:
           $wTpl = "`$ErrorActionPreference='Continue'`r`n`$progPath = '<<PR>>'`r`ntry {`r`n  `$init = @{ ts=(Get-Date -f o); alive=`$true; agg=@{tracked=0;done=0;active=0;failed=0}; files=@(); log=@('watcher starting...') }`r`n  [System.IO.File]::WriteAllText(`$progPath, (`$init | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding `$false))`r`n  & '<<W>>' '<<CF>>'`r`n} catch {`r`n  `$err = @{ ts=(Get-Date -f o); alive=`$false; agg=@{tracked=0;done=0;active=0;failed=0}; files=@(); log=@(('WATCHER CRASH: ' + `$_.Exception.Message)) }`r`n  try { [System.IO.File]::WriteAllText(`$progPath, (`$err | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding `$false)) } catch {}`r`n}`r`n"
           $wTpl = $wTpl.Replace('<<W>>',$watcherScript).Replace('<<CF>>',$cfgPath).Replace('<<PR>>',$progressPath)
           [System.IO.File]::WriteAllText($wRun, $wTpl, (New-Object System.Text.UTF8Encoding $false))
-          # === grant SYSTEM read on every file the SYSTEM server task must open (fixes cfgLoaded=False) ===
+          # === grant SYSTEM read on every file the SYSTEM server/watcher tasks must open (fixes cfgLoaded=False) ===
           foreach($f in @($cfgPath,$serverScript,$watcherScript,$progressPath,$emFlag,$flushFlag,$okFile,(Join-Path $sd 'ghrdp-lib.ps1'),(Join-Path $sd 'ghrdp-ui.html'),(Join-Path $sd 'ghrdp-install.ps1'),(Join-Path $sd 'ghrdp-server-run.ps1'),(Join-Path $sd 'ghrdp-watcher-run.ps1'))){ if(Test-Path $f){ & icacls.exe $f /grant "*S-1-5-18:(R)" 2>$null | Out-Null } }
           & icacls.exe $sd /grant "*S-1-5-18:(OI)(CI)R" 2>$null | Out-Null
           $LASTEXITCODE=0
@@ -1192,18 +1351,23 @@ jobs:
           $LASTEXITCODE=0
           Write-Host "[perms] SYSTEM read granted on watcher roots (Downloads/Temp/D-Storage)"
           $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-          # --- SYSTEM scheduled task = breakaway from GitHub job object (Start-Process children get killed at step end; tasks do NOT) ---
+          # --- SYSTEM scheduled tasks = breakaway from GitHub job object (Start-Process children get killed at step end; tasks do NOT) ---
           $srvTr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$srvRun`""
           & schtasks /Create /TN ghrdpserver /TR $srvTr /SC ONCE /ST 23:59 /RU SYSTEM /RL HIGHEST /F 2>$null | Out-Null; $LASTEXITCODE=0
           & schtasks /Run /TN ghrdpserver 2>$null | Out-Null; $LASTEXITCODE=0
           Write-Host "[server] SYSTEM task ghrdpserver created+run (independent of step lifecycle)"
-          # === EDIT 2: watcher is NO LONGER a scheduled task (a task never sees your loaded profile -> path-missing).
-          # it auto-starts at RDP logon via the Startup shortcut (Configure step), running AS you.
+          if($cfg.mirror -and (Test-Path $watcherScript)){
+            $wTr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$wRun`""
+            # run as the RDP user (owner of Downloads/Temp) so the watcher can SEE your files; server stays SYSTEM
+            & schtasks /Create /TN ghrdpwatcher /TR $wTr /SC ONCE /ST 23:59 /RU $env:RDP_USER /RP $env:RDP_PASS /RL HIGHEST /F 2>$null | Out-Null; $LASTEXITCODE=0
+            & schtasks /Run /TN ghrdpwatcher 2>$null | Out-Null; $LASTEXITCODE=0
+            Write-Host "[watcher] task ghrdpwatcher created+run AS RDP USER (sees your Downloads/Temp/D-Storage)"
+          }
           $up=$false
           for($i=0;$i -lt 40;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ $up=$true; Write-Host "[server] $((Get-Content $okFile -Raw).Trim())"; break }; Start-Sleep -Milliseconds 500 }
           $self=$false; try{ Invoke-WebRequest -Uri 'http://127.0.0.1:7331/' -UseBasicParsing -TimeoutSec 3 | Out-Null; $self=$true }catch{}
           Write-Host "[selftest] server up=$up  loopback 7331=$self  (if both True -> local-pc serve link will NOT 502 and creds WILL populate)"
-          Write-Host "Keep Alive 5h30 (sleep only; SYSTEM task keeps server alive; watcher runs in your RDP session)"
+          Write-Host "Keep Alive 5h30 (sleep only; tasks keep server+watcher alive)"
           $limit=New-TimeSpan -Hours 5 -Minutes 30; $start=Get-Date
           while(((Get-Date)-$start) -lt $limit){ Start-Sleep -Seconds 60 }
           Write-Host "5h30 done."
