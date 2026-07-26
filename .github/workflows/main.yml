@@ -365,14 +365,25 @@ jobs:
             $qp=@{}; if($lines[0] -match '\?(.+)\s'){ foreach($kv in ($Matches[1] -split '&')){ $p=$kv -split '='; if($p.Length -eq 2){ $qp[$p[0].ToLower()]=[uri]::UnescapeDataString($p[1]) } } }
             return @{ headers=$h; query=$qp }
           }
-          # === source-IP aware: loopback + Tailscale CGNAT (100.64/10) = trusted (already Tailscale-authed) ===
-          function Is-Trusted($client){
+          # === DEFINITIVE trust check: loopback(v4/v6) + CGNAT + Tailscale ULA + mapped-IPv4 + serve-proxy header ===
+          function Is-Trusted($client,$parsed){
             try {
               $addr = $client.Client.RemoteEndPoint.Address
-              if($addr.IsLoopback){ return $true }
+              if($addr.IsLoopback){ return $true }                                   # 127.0.0.1 / ::1
               $b = $addr.GetAddressBytes()
-              if($b.Length -eq 4 -and $b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127){ return $true }
+              if($b.Length -eq 4){                                                    # IPv4
+                if($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127){ return $true } # 100.64/10 CGNAT
+              } elseif($b.Length -eq 16){                                             # IPv6
+                if($b[0] -eq 0xfd -and $b[1] -eq 0x7a -and $b[2] -eq 0x11 -and $b[3] -eq 0x5c -and $b[4] -eq 0xa1 -and $b[5] -eq 0xe0){ return $true }  # fd7a:115c:a1e0:: Tailscale ULA
+                if($b[0] -eq 0 -and $b[10] -eq 0xff -and $b[11] -eq 0xff){            # ::ffff:x.x.x.x mapped
+                  if($b[12] -eq 127){ return $true }
+                  if($b[12] -eq 100 -and $b[13] -ge 64 -and $b[13] -le 127){ return $true }
+                }
+              }
             } catch {}
+            # serve proxy adds X-Forwarded-Host: <node>.ts.net  (cannot be spoofed from outside; 7331 not public)
+            $xfh = if($parsed -and $parsed.headers){ $parsed.headers['x-forwarded-host'] } else { $null }
+            if($xfh -and ($xfh -match '\.ts\.net$')){ return $true }
             return $false
           }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
@@ -382,7 +393,7 @@ jobs:
               $stream=$client.GetStream(); $req=ReadReq $stream; $parsed=ParseHeaders $req
               $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=($Matches[1] -split '\?')[0] }
               $cfg=$null; try{ $cfg=Get-Content $CfgPath -Raw|ConvertFrom-Json -ErrorAction Stop }catch{}
-              $trusted = Is-Trusted $client
+              $trusted = Is-Trusted $client $parsed
               $keyOk = $trusted -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
               if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - unauthorized (not from loopback/tailnet and no valid ?key=)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
               if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
@@ -646,26 +657,23 @@ jobs:
             document.getElementById('diagBtn').addEventListener('click',function(){
               var box=document.getElementById('diagBox'); var out=document.getElementById('diagOut');
               box.style.display='block'; out.innerHTML='running diagnostics…';
-              fetch('/diag',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-                var L=[];
-                L.push('== SERVER SELF TEST (/diag) ==');
-                L.push('bind 0.0.0.0            : '+yn(d.bindOk));
-                L.push('port 7331 listening     : '+yn(d.portListening));
-                L.push('firewall rule present   : '+yn(d.firewallRulePresent));
-                L.push('tailscale ip            : '+(d.tailscaleIp||'(none)'));
-                L.push('self-connect via TS ip  : '+yn(d.selfConnectFromVmViaTailscaleIp)+'  (FAIL here is EXPECTED -> GitHub blocks it; Funnel+handler is the path)');
-                L.push('funnel url              : '+(d.funnelUrl||'(not enabled)'));
-                L.push('this request via loopbk : '+yn(d.requestCameViaLoopback)+'   host='+d.requestHost);
-                L.push('');
-                L.push('== HOW ZERO-TYPING RDP WORKS ==');
-                L.push('On your LOCAL pc this page auto-fires ghrdp:// -> your installed handler');
-                L.push('runs cmdkey (saves password) + mstsc -> RDP opens with NO typing.');
-                L.push('First time: browser asks "Open app?" -> tick ALWAYS ALLOW + Open.');
-                L.push('If auto did not fire: click the purple "Open RDP now" button at the top.');
-                L.push('');
-                L.push('raw: '+JSON.stringify(d,null,1));
-                out.innerHTML=L.join('\n');
-              }).catch(function(e){ out.innerHTML='<span class="bad">/diag failed: '+e+'</span>'; });
+              fetch('/diag'+(location.search||''),{cache:'no-store'}).then(function(r){
+                handleJson(r, function(d, err){
+                  var out=document.getElementById('diagOut');
+                  if(err){ out.innerHTML='<span class="bad">/diag '+err+'</span>'; return; }
+                  var L=[];
+                  L.push('requestTrusted        : '+yn(d.requestTrusted));
+                  L.push('port 7331 listening   : '+yn(d.portListening));
+                  L.push('firewall rule present : '+yn(d.firewallRulePresent));
+                  L.push('tailscale ip          : '+(d.tailscaleIp||'(none)'));
+                  L.push('request host          : '+(d.requestHost||'-'));
+                  L.push('');
+                  L.push('If requestTrusted = FAIL from the serve link, EDIT 1 (Is-Trusted) is not applied yet.');
+                  L.push('');
+                  L.push('raw: '+JSON.stringify(d,null,1));
+                  out.innerHTML=L.join('\n');
+                });
+              });
             });
             function render(s){
               if(!s){ return; }
@@ -694,7 +702,34 @@ jobs:
               var bn=document.getElementById('banner'); bn.className='banner';
               if(s.mirror){ if((a.failed||0)>0 && (a.active||0)===0){ bn.className='banner warn'; bn.textContent=(a.failed)+' file(s) failed — retry or check log.'; } else if((a.tracked||0)>0 && (a.active||0)===0 && (a.failed||0)===0 && (a.done||0)>0){ bn.className='banner safe'; bn.textContent='ALL UPLOADED — safe to Cancel workflow now.'; } }
             }
-            function poll(){ fetch('/progress',{cache:'no-store'}).then(function(r){return r.json();}).then(render).catch(function(){}); }
+            var QS=location.search||'';
+            function handleJson(r, onOk){
+              if(!r.ok){
+                if(r.status === 401){ onOk(null, 'auth'); }
+                else { onOk(null, 'http'+r.status); }
+                return;
+              }
+              r.text().then(function(t){
+                try { onOk(JSON.parse(t), null); }
+                catch(e){ onOk(null, 'parse: '+e.message); }
+              });
+            }
+            function poll(){
+              fetch('/progress'+QS,{cache:'no-store'}).then(function(r){
+                handleJson(r, function(s, err){
+                  if(err === 'auth'){ showAuthBlocked(); return; }
+                  if(s){ clearAuthBlocked(); render(s); }
+                });
+              }).catch(function(){ /* network blip - keep last state */ });
+            }
+            var authBlocked=false;
+            function showAuthBlocked(){
+              if(authBlocked) return; authBlocked=true;
+              var box=document.getElementById('diagBox'); if(box){ box.style.display='block'; }
+              var out=document.getElementById('diagOut');
+              if(out){ out.innerHTML='<span class="bad">Server reached but returned 401 on /progress.</span>\nThis build still has the old trust check. Apply EDIT 1 (Is-Trusted) and re-run.\n(If you already applied it, hard-refresh this tab once.)'; }
+            }
+            function clearAuthBlocked(){ if(authBlocked){ authBlocked=false; var box=document.getElementById('diagBox'); if(box) box.style.display='none'; } }
             document.getElementById('emBtn').addEventListener('click',function(){ var b=this; b.disabled=true; b.textContent='triggered…'; fetch('/emergency',{cache:'no-store'}).then(function(){ setTimeout(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; },1500); }).catch(function(){ b.disabled=false; b.textContent='⚡ Upload everything now'; }); });
             poll(); setInterval(poll,1500);
           })();
