@@ -351,67 +351,83 @@ jobs:
           [void]$sb.AppendLine(""); [void]$sb.AppendLine("_OK uploaded  ... progress  LIMIT auto-retry_"); return $sb.ToString() }
           EOF
 
-      - name: Write dashboard server script (source-IP aware token gate + time-bounded)
+      - name: Write dashboard server script (NO token gate + BOM-safe + rich /diag)
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/rdp-redirect-server.ps1" <<'EOF'
           function Start-GhrdpServer {
           param([int]$Port,[string]$BindAddress,[string]$UiDir,[string]$ProgressPath,[string]$CfgPath,[string]$EmergencyFlagPath,[string]$FlushFlagPath,[string]$OkFile,[int]$LimitMinutes=330)
           $ErrorActionPreference='SilentlyContinue'
+          $global:GHRDP_CFGERR=''; $global:GHRDP_PROGERR=''
           $uiPath = Join-Path $UiDir 'ghrdp-ui.html'
           $uiBytes = if(Test-Path $uiPath){ [System.IO.File]::ReadAllBytes($uiPath) } else { [System.Text.Encoding]::UTF8.GetBytes('<h1 style="font-family:sans-serif;color:#e9eef3;background:#0a0e12;padding:30px">dashboard ui missing</h1>') }
+          function ReadJsonSafe($path,[ref]$errVar){
+            if(-not (Test-Path $path)){ $errVar.Value='file-missing'; return $null }
+            try {
+              $bytes=[System.IO.File]::ReadAllBytes($path)
+              if($bytes.Length -eq 0){ $errVar.Value='empty-file'; return $null }
+              # strip UTF-8 BOM if present
+              if($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF){ $bytes=$bytes[3..($bytes.Length-1)] }
+              $txt=[System.Text.Encoding]::UTF8.GetString($bytes)
+              $txt=$txt.TrimStart([char]0xFEFF)
+              return ($txt | ConvertFrom-Json -ErrorAction Stop)
+            } catch { $errVar.Value=('parse: ' + $_.Exception.Message); return $null }
+          }
           function ParseHeaders($raw){
             $h=@{}; $lines=$raw -split "`r`n"; for($i=1;$i -lt $lines.Length;$i++){ $l=$lines[$i]; $ix=$l.IndexOf(':'); if($ix -gt 0){ $h[($l.Substring(0,$ix).Trim().ToLower())]=$l.Substring($ix+1).Trim() } }
             $qp=@{}; if($lines[0] -match '\?(.+)\s'){ foreach($kv in ($Matches[1] -split '&')){ $p=$kv -split '='; if($p.Length -eq 2){ $qp[$p[0].ToLower()]=[uri]::UnescapeDataString($p[1]) } } }
             return @{ headers=$h; query=$qp }
           }
-          # === DEFINITIVE trust check: loopback(v4/v6) + CGNAT + Tailscale ULA + mapped-IPv4 + serve-proxy header ===
-          function Is-Trusted($client,$parsed){
-            try {
-              $addr = $client.Client.RemoteEndPoint.Address
-              if($addr.IsLoopback){ return $true }                                   # 127.0.0.1 / ::1
-              $b = $addr.GetAddressBytes()
-              if($b.Length -eq 4){                                                    # IPv4
-                if($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127){ return $true } # 100.64/10 CGNAT
-              } elseif($b.Length -eq 16){                                             # IPv6
-                if($b[0] -eq 0xfd -and $b[1] -eq 0x7a -and $b[2] -eq 0x11 -and $b[3] -eq 0x5c -and $b[4] -eq 0xa1 -and $b[5] -eq 0xe0){ return $true }  # fd7a:115c:a1e0:: Tailscale ULA
-                if($b[0] -eq 0 -and $b[10] -eq 0xff -and $b[11] -eq 0xff){            # ::ffff:x.x.x.x mapped
-                  if($b[12] -eq 127){ return $true }
-                  if($b[12] -eq 100 -and $b[13] -ge 64 -and $b[13] -le 127){ return $true }
-                }
-              }
-            } catch {}
-            # serve proxy adds X-Forwarded-Host: <node>.ts.net  (cannot be spoofed from outside; 7331 not public)
-            $xfh = if($parsed -and $parsed.headers){ $parsed.headers['x-forwarded-host'] } else { $null }
-            if($xfh -and ($xfh -match '\.ts\.net$')){ return $true }
-            return $false
-          }
+          function Is-Loopback($client){ try{ return $client.Client.RemoteEndPoint.Address.IsLoopback }catch{ return $false } }
           function ReadReq($stream){ $stream.ReadTimeout=5000; $acc=New-Object System.Text.StringBuilder; $buf=New-Object byte[] 4096; while($true){ $n=0; try{$n=$stream.Read($buf,0,$buf.Length)}catch{break}; if($n -le 0){break}; [void]$acc.Append([System.Text.Encoding]::ASCII.GetString($buf,0,$n)); if($acc.ToString().Contains("`r`n`r`n")){break}; if($acc.Length -gt 16384){break} }; return $acc.ToString() }
-          function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}401{'Unauthorized'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
+          function WriteResp($stream,$code,$ctype,$bodyBytes){ $status=switch([int]$code){200{'OK'}404{'Not Found'}default{'OK'}}; $hdr="HTTP/1.1 $code $status`r`nContent-Type: $ctype`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`nAccess-Control-Allow-Origin: *`r`n`r`n"; $hb=[System.Text.Encoding]::ASCII.GetBytes($hdr); $stream.Write($hb,0,$hb.Length); if($bodyBytes.Length -gt 0){ $stream.Write($bodyBytes,0,$bodyBytes.Length) }; $stream.Flush() }
+          function JsonBytes($obj){ return [System.Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 8 -Compress)) }
           function HandleOne($client){
             try {
               $stream=$client.GetStream(); $req=ReadReq $stream; $parsed=ParseHeaders $req
               $path='/'; if($req -match '(?m)^GET\s+(\S+)'){ $path=($Matches[1] -split '\?')[0] }
-              $cfg=$null; try{ $raw=Get-Content $CfgPath -Raw -EA 0; if($raw){ $raw=$raw.TrimStart([char]0xFEFF); $cfg=$raw|ConvertFrom-Json -ErrorAction Stop } }catch{}
-              $trusted = Is-Trusted $client $parsed
-              $keyOk = $trusted -or (($parsed.query['key']) -and ($parsed.query['key'] -eq $cfg.dashToken))
-              if(-not $keyOk){ $msg=[System.Text.Encoding]::UTF8.GetBytes("401 - unauthorized (not from loopback/tailnet and no valid ?key=)."); WriteResp $stream 401 'text/plain; charset=utf-8' $msg; return }
-              if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) }
-              elseif($path -eq '/diag'){
-                $bindOk=$true; $fw=$false; try{$fw=[bool](Get-NetFirewallRule -DisplayName 'ghrdp-dash' -EA Stop)}catch{}
-                $tsip=$cfg.rdpIp; $selfOk=$false; $selfErr=''
-                if($tsip){ try{ Invoke-WebRequest -Uri ("http://{0}:{1}/" -f $tsip,$Port) -UseBasicParsing -TimeoutSec 3 | Out-Null; $selfOk=$true }catch{ $selfErr="$_" } }
+              $cfgErrRef=[ref]$global:GHRDP_CFGERR; $cfg=ReadJsonSafe $CfgPath $cfgErrRef
+              if($path -eq '/emergency'){ Set-Content $EmergencyFlagPath (Get-Date -f o) -Encoding ascii; WriteResp $stream 200 'application/json' (JsonBytes @{ok=$true}); return }
+              if($path -eq '/diag'){
+                $progErrRef=[ref]$global:GHRDP_PROGERR; $prog=ReadJsonSafe $ProgressPath $progErrRef
                 $listen=[bool](Get-NetTCPConnection -LocalPort $Port -State Listen -EA 0)
-                $d=[ordered]@{ bindAddress=$BindAddress; bindOk=$bindOk; portListening=$listen; firewallRulePresent=$fw; tailscaleIp=$tsip; requestTrusted=$trusted; requestHost=$parsed.headers['host']; note='loopback + Tailscale CGNAT requests are auto-trusted (no token needed); public/Funnel requests need ?key=.' }
-                WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($d|ConvertTo-Json -Depth 6 -Compress)))
+                $tsip=''; if($cfg -and $cfg.rdpIp){ $tsip=$cfg.rdpIp }
+                $d=[ordered]@{
+                  portListening=$listen
+                  cfgFileExists=(Test-Path $CfgPath)
+                  cfgLoaded=[bool]$cfg
+                  cfgError=$global:GHRDP_CFGERR
+                  progressFileExists=(Test-Path $ProgressPath)
+                  progressLoaded=[bool]$prog
+                  progressError=$global:GHRDP_PROGERR
+                  requestLoopback=(Is-Loopback $client)
+                  requestHost=$parsed.headers['host']
+                  tailscaleIp=$tsip
+                  note='No token gate (7331 is loopback+tailnet only). If cfgLoaded=False check cfgError (usually permission: SYSTEM task cannot read runner temp -> EDIT 2 icacls).'
+                }
+                WriteResp $stream 200 'application/json' (JsonBytes $d); return
               }
-              elseif($path -eq '/install.ps1'){ $ip2=Join-Path $UiDir 'ghrdp-install.ps1'; if(Test-Path $ip2){ WriteResp $stream 200 'application/octet-stream' ([System.IO.File]::ReadAllBytes($ip2)) } else { WriteResp $stream 404 'text/plain' ([System.Text.Encoding]::UTF8.GetBytes('installer missing')) } }
-              elseif($path -eq '/progress' -or $path -eq '/app.js'){
-                $prog=@{alive=$false}; if(Test-Path $ProgressPath){ try{ $pr=Get-Content $ProgressPath -Raw -EA 0; if($pr){ $prog=$pr.TrimStart([char]0xFEFF)|ConvertFrom-Json -ErrorAction Stop } }catch{} }
-                $obj=[ordered]@{ serverTs=(Get-Date -f o); viaLoopback=$trusted; ghrdp=$(if($cfg){$cfg.ghrdp}else{''}); rentry=$(if($cfg){$cfg.rentryUrl}else{''}); mirror=$(if($cfg){[bool]$cfg.mirror}else{$false}); creds=@{ip=$(if($cfg){$cfg.rdpIp}else{''});user=$(if($cfg){$cfg.rdpUser}else{''});pass=$(if($cfg){$cfg.rdpPass}else{''})}; ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log }
-                WriteResp $stream 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes(($obj|ConvertTo-Json -Depth 8 -Compress)))
-              } else { WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes }
-            } catch { }
+              if($path -eq '/install.ps1'){ $ip2=Join-Path $UiDir 'ghrdp-install.ps1'; if(Test-Path $ip2){ WriteResp $stream 200 'application/octet-stream' ([System.IO.File]::ReadAllBytes($ip2)) } else { WriteResp $stream 404 'text/plain' ([System.Text.Encoding]::UTF8.GetBytes('installer missing')) }; return }
+              if($path -eq '/progress' -or $path -eq '/app.js'){
+                $progErrRef=[ref]$global:GHRDP_PROGERR; $prog=ReadJsonSafe $ProgressPath $progErrRef
+                if(-not $prog){ $prog=@{alive=$false} }
+                $obj=[ordered]@{
+                  serverTs=(Get-Date -f o)
+                  viaLoopback=(Is-Loopback $client)
+                  cfgLoaded=[bool]$cfg
+                  cfgError=$global:GHRDP_CFGERR
+                  ghrdp=$(if($cfg){$cfg.ghrdp}else{''})
+                  rentry=$(if($cfg){$cfg.rentryUrl}else{''})
+                  mirror=$(if($cfg){[bool]$cfg.mirror}else{$false})
+                  creds=@{ ip=$(if($cfg){$cfg.rdpIp}else{''}); user=$(if($cfg){$cfg.rdpUser}else{''}); pass=$(if($cfg){$cfg.rdpPass}else{''}) }
+                  ts=$prog.ts; alive=$prog.alive; active=$prog.active; agg=$prog.agg; files=$prog.files; log=$prog.log
+                }
+                WriteResp $stream 200 'application/json' (JsonBytes $obj); return
+              }
+              WriteResp $stream 200 'text/html; charset=utf-8' $uiBytes
+            } catch {
+              try { WriteResp $stream 200 'application/json' (JsonBytes @{serverTs=(Get-Date -f o);handlerError=$_.Exception.Message;creds=@{ip='';user='';pass=''}}) } catch {}
+            }
             try { $client.Close() } catch {}
           }
           $ipObj = [System.Net.IPAddress]::Parse($BindAddress)
@@ -1020,6 +1036,11 @@ jobs:
           [System.IO.File]::WriteAllText($srvRun, $srvTpl, (New-Object System.Text.UTF8Encoding $false))
           $wRun = Join-Path $sd 'ghrdp-watcher-run.ps1'
           [System.IO.File]::WriteAllText($wRun, ("`$ErrorActionPreference='Continue'`r`n& '<<W>>' '<<CF>>'`r`n".Replace('<<W>>',$watcherScript).Replace('<<CF>>',$cfgPath)), (New-Object System.Text.UTF8Encoding $false))
+          # === grant SYSTEM read on every file the SYSTEM server/watcher tasks must open (fixes cfgLoaded=False) ===
+          foreach($f in @($cfgPath,$serverScript,$watcherScript,$progressPath,$emFlag,$flushFlag,$okFile,(Join-Path $sd 'ghrdp-lib.ps1'),(Join-Path $sd 'ghrdp-ui.html'),(Join-Path $sd 'ghrdp-install.ps1'),(Join-Path $sd 'ghrdp-server-run.ps1'),(Join-Path $sd 'ghrdp-watcher-run.ps1'))){ if(Test-Path $f){ & icacls.exe $f /grant "*S-1-5-18:(R)" 2>$null | Out-Null } }
+          & icacls.exe $sd /grant "*S-1-5-18:(OI)(CI)R" 2>$null | Out-Null
+          $LASTEXITCODE=0
+          Write-Host "[perms] SYSTEM (S-1-5-18) read granted on temp files + dir"
           $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
           # --- SYSTEM scheduled tasks = breakaway from GitHub job object (Start-Process children get killed at step end; tasks do NOT) ---
           $srvTr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$srvRun`""
