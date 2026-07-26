@@ -40,7 +40,9 @@ jobs:
           Start-Process msiexec.exe -Wait -ArgumentList '/i tailscale-setup.msi /quiet'
           Start-Sleep -Seconds 5
 
-      - name: Get Tailscale sign-in link
+      - name: Get Tailscale sign-in link (auto if TS_AUTHKEY secret set, else guided)
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $daemonOk = $false
@@ -50,26 +52,40 @@ jobs:
             Start-Sleep -Seconds 2
           }
           if (-not $daemonOk) { throw "tailscaled not started." }
-          $upLog = Join-Path $env:RUNNER_TEMP "ts-up.log"; $upErr = Join-Path $env:RUNNER_TEMP "ts-up.err"
-          $null = Start-Process -FilePath $ts -ArgumentList "up" -RedirectStandardOutput $upLog -RedirectStandardError $upErr -WindowStyle Hidden -PassThru
-          $url = $null
-          # === LONG + lock-safe wait (regression fix: was too short at 40s) ===
-          for ($i = 0; $i -lt 90; $i++) {
-            $txt = ""
-            foreach ($f in @($upLog, $upErr)) {
-              if (Test-Path $f) {
-                try { $fs = [System.IO.File]::Open($f,'Open','Read','ReadWrite'); $sr = New-Object System.IO.StreamReader($fs); $txt += $sr.ReadToEnd(); $sr.Close(); $fs.Close() } catch { }
-              }
+          $S = $env:GITHUB_STEP_SUMMARY
+          if ($env:TS_AUTHKEY) {
+            # ---- FULLY AUTOMATIC: no human click needed ----
+            $upLog = Join-Path $env:RUNNER_TEMP "ts-up.log"; $upErr = Join-Path $env:RUNNER_TEMP "ts-up.err"
+            $null = Start-Process -FilePath $ts -ArgumentList @("up","--authkey=$($env:TS_AUTHKEY)","--accept-dns=true") -RedirectStandardOutput $upLog -RedirectStandardError $upErr -WindowStyle Hidden -PassThru
+            $ok=$false
+            for ($i=0;$i -lt 60;$i++){ try{ $j=& $ts status --json 2>$null|ConvertFrom-Json -EA Stop; if($j -and $j.BackendState -eq 'Running'){ $ok=$true; break } }catch{}; Start-Sleep -Seconds 2 }
+            if (-not $ok) { throw "Auth-key login did not reach Running. Check the key is valid + not expired + reusable/ephemeral as intended." }
+            Write-Host "TAILSCALE AUTO-LOGGED-IN via TS_AUTHKEY (no click needed). IP = $((& $ts ip -4).Trim())"
+            "### Tailscale: auto-logged-in via TS_AUTHKEY (hands-free) ✅" >> $S
+          } else {
+            # ---- GUIDED: print sign-in link + a clickable first-time setup guide ----
+            $upLog = Join-Path $env:RUNNER_TEMP "ts-up.log"; $upErr = Join-Path $env:RUNNER_TEMP "ts-up.err"
+            $null = Start-Process -FilePath $ts -ArgumentList "up" -RedirectStandardOutput $upLog -RedirectStandardError $upErr -WindowStyle Hidden -PassThru
+            $url = $null
+            for ($i = 0; $i -lt 90; $i++) {
+              $txt = ""
+              foreach ($f in @($upLog, $upErr)) { if (Test-Path $f) { try { $fs = [System.IO.File]::Open($f,'Open','Read','ReadWrite'); $sr = New-Object System.IO.StreamReader($fs); $txt += $sr.ReadToEnd(); $sr.Close(); $fs.Close() } catch { } } }
+              if ($txt -match 'https://login\.tailscale\.com/[A-Za-z0-9_/\-]+') { $url = $Matches[0]; break }
+              Start-Sleep -Seconds 2
             }
-            if ($txt -match 'https://login\.tailscale\.com/[A-Za-z0-9_/\-]+') { $url = $Matches[0]; break }
-            Start-Sleep -Seconds 2
+            if (-not $url) { Write-Host $txt; throw "Sign-in link not found." }
+            Write-Host "TAILSCALE SIGN-IN LINK (click now): $url"
+            $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
+            $keysPage  = "https://login.tailscale.com/admin/settings/keys"
+            $secretPage = "https://github.com/$($env:GITHUB_REPOSITORY)/settings/secrets/actions/new"
+            "### Tailscale Sign-in (click now - works while job runs)" >> $S
+            "" >> $S; "**[$url]($url)**" >> $S; "" >> $S
+            "### Make the NEXT run 100% hands-free (one-time): add a Tailscale auth-key secret" >> $S
+            "" >> $S
+            "1. Open the Tailscale auth-keys page (click): **[$keysPage]($keysPage)** -> **Generate auth key** -> tick **Reusable** (or Ephemeral) + **Expire in 90 days** -> copy the `tskey-auth-...` string." >> $S
+            "2. Open your repo secret page (click): **[$secretPage]($secretPage)** -> Name = ``TS_AUTHKEY`` -> Value = paste the key -> **Add secret**." >> $S
+            "3. Re-run. The workflow then logs Tailscale in by itself (no link to click). Until then, click the sign-in link above each run." >> $S
           }
-          if (-not $url) { Write-Host $txt; throw "Sign-in link not found." }
-          Write-Host "TAILSCALE SIGN-IN LINK: $url"
-          $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
-          "### Tailscale Sign-in (also in the Summary tab - open it there if this log won't expand)" >> $env:GITHUB_STEP_SUMMARY
-          "" >> $env:GITHUB_STEP_SUMMARY
-          "**[$url]($url)**" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Wait for Tailscale sign-in
         run: |
@@ -804,7 +820,6 @@ jobs:
           $ErrorActionPreference='Continue'
           $progEarly = Join-Path (Split-Path $CfgPath -Parent) 'ghrdp_progress.json'
           function Write-HB($msg){ try{ $h=@{ts=(Get-Date -f o);alive=$true;agg=@{tracked=0;done=0;active=0;failed=0};files=@();log=@($msg)}; [System.IO.File]::WriteAllText($progEarly,($h|ConvertTo-Json -Depth 6 -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
-          # BOM-safe cfg read
           $cfg=$null
           try{ $b=[System.IO.File]::ReadAllBytes($CfgPath); if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }; $cfg=([System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF))|ConvertFrom-Json -ErrorAction Stop }catch{ Write-HB ('WATCHER CFG READ FAIL: ' + $_.Exception.Message); throw }
           if(-not $cfg){ Write-HB 'WATCHER CFG NULL'; throw 'cfg null' }
@@ -812,12 +827,21 @@ jobs:
           . $cfg.libPath
           if(-not (Get-Command Init-Progress -ErrorAction SilentlyContinue)){ Write-HB ('WATCHER LIB NOT LOADED: ' + $cfg.libPath + ' exists=' + (Test-Path $cfg.libPath)); throw 'lib not loaded' }
           Init-Progress $cfg.progressPath
-          # === guaranteed non-null error sink (fixes the iter=N null-method that aborted the whole loop) ===
           $script:RUNLOG = New-Object System.Collections.ArrayList
+          $script:SCAN   = @{}
           function LErr($t,$e){ $m=("[{0}] {1}: {2}" -f (Get-Date -f 'HH:mm:ss'),$t,$e.Exception.Message); [void]$script:RUNLOG.Add($m); try{ if($global:GHRDP_PROG -and $global:GHRDP_PROG.log){ $global:GHRDP_PROG.log = @($global:GHRDP_PROG.log) + $m } }catch{}; try{ Add-Content $cfg.logFile $m -EA 0 }catch{} }
+          function ScanLine{
+            $parts = @($script:SCAN.GetEnumerator() | ForEach-Object {
+              $v=$_.Value; $s=$_.Key + ':raw=' + $v.rawTotal + '/elig=' + $v.eligible
+              if($v.rawSamples -and $v.rawSamples.Count){ $s += ' :: ' + ($v.rawSamples -join ', ') }
+              if($v.error){ $s += ' ERR=' + $v.error }
+              $s
+            })
+            return ('[scan] ' + ($parts -join ' | '))
+          }
           Write-HB 'watcher lib loaded - entering scan loop'
           try{ Push-Rentry $cfg (Build-Rentry $cfg $idx) | Out-Null }catch{ LErr 'init-err' $_ }
-          $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak')
+          $junk=@('.tmp','.crdownload','.partial','.lock','.log','.etl','.pf','.db-journal','.sqlite-journal','.old','.bak','.!qb')
           $done=@{}; if(Test-Path $cfg.doneFile){ Get-Content $cfg.doneFile | %{$done[$_]=$true} }
           $idx=Load-Index $cfg
           function DoUpload($fi,$tag){
@@ -836,7 +860,22 @@ jobs:
             else { $ex.status='limit'; $ex.time=(Get-Date -f 'HH:mm:ss'); Save-Index $cfg $idx; try{ Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null }catch{}; "[$(Get-Date -f o)] LIMIT $tag $($fi.Name)"|Out-File $cfg.logFile -Append }
             Set-Active '' 'idle' 0 }
           function Proc($fi,$tag){ if($done.ContainsKey($fi.FullName)){return}; DoUpload $fi $tag }
-          function Scan($r){ if(-not (Test-Path $r.path)){return}; $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue}; foreach($fi in $items){ if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}; if($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}; Proc $fi $r.tag } }
+          function Scan($r){
+            $elig=0; $esamp=New-Object System.Collections.ArrayList; $rawAll=@(); $rerr=''
+            if(-not (Test-Path $r.path)){ $script:SCAN[$r.tag]=@{rawTotal=0;eligible=0;path=$r.path;error='path-missing';rawSamples=@()}; return }
+            try{ $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -EA 0}else{Get-ChildItem -LiteralPath $r.path -File -EA 0} }catch{ $script:SCAN[$r.tag]=@{rawTotal=-1;eligible=0;path=$r.path;error=$_.Exception.Message;rawSamples=@()}; return }
+            $rawAll=@($items)
+            $rawNames=@($rawAll | Select-Object -First 4 | ForEach-Object { $_.Name })
+            foreach($fi in $rawAll){
+              if($done.ContainsKey($fi.FullName)){continue}
+              if($junk -contains $fi.Extension.ToLower()){continue}
+              if($fi.Length -lt $r.min){continue}
+              if($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}
+              $elig++; if($esamp.Count -lt 6){ [void]$esamp.Add(($fi.Name + ' (' + [math]::Round($fi.Length/1MB,1) + 'MB)')) }
+              Proc $fi $r.tag
+            }
+            $script:SCAN[$r.tag]=@{rawTotal=$rawAll.Count;eligible=$elig;path=$r.path;error=$rerr;rawSamples=$rawNames;eligibleSamples=@($esamp)}
+          }
           function SweepAll($r){ if(-not (Test-Path $r.path)){return}; $items=if($r.rec){Get-ChildItem -LiteralPath $r.path -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Sort-Object Length -Descending}else{Get-ChildItem -LiteralPath $r.path -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending}; foreach($fi in $items){ if($done.ContainsKey($fi.FullName)){continue}; if($junk -contains $fi.Extension.ToLower()){continue}; if($fi.Length -lt $r.min){continue}; if($fi.FullName -match '\\(Windows|\$Recycle\.Bin|Program Files|Program Files \(x86\)|ProgramData|hostedtoolcache|\\a\\)'){continue}; DoUpload $fi $r.tag } }
           function EmergencyPass{
             "[$(Get-Date -f o)] EMERGENCY pass start"|Out-File $cfg.logFile -Append
@@ -852,9 +891,9 @@ jobs:
               $p=$global:GHRDP_PROG; $d=0;$u=0;$f=0; foreach($it in $idx){ if($it.status -eq 'ok'){$d++} elseif($it.status -eq 'limit'){$f++} else {$u++} }
               $p.agg.done=$d; $p.agg.failed=$f; $p.agg.tracked=$idx.Count; $p.agg.active=if($p.active.phase -ne 'idle'){1}else{0}; $p.agg.bytesTotal=$global:GHRDP_TOTAL_BYTES
               $p.files=@( foreach($it in $idx){ @{name=$it.name;src=$it.src;status=$it.status} } )
-              $errs=@($script:RUNLOG | Select-Object -Last 8)
-              $filetail=@(); if(Test-Path $cfg.logFile){ $g=Get-Content $cfg.logFile -Tail 20 -EA 0; if($g){ $filetail=@($g) } }
-              $p.log = @($errs) + $filetail
+              $errs=@($script:RUNLOG | Select-Object -Last 6)
+              $filetail=@(); if(Test-Path $cfg.logFile){ $g=Get-Content $cfg.logFile -Tail 12 -EA 0; if($g){ $filetail=@($g) } }
+              $p.log = @($errs) + @(ScanLine) + $filetail
               Flush-Progress $true
             }catch{ LErr 'sync-err' $_ }
           }
@@ -863,7 +902,6 @@ jobs:
           $iter=0
           while($true){
             $iter++
-            # EVERY sub-op has its own try/catch -> NOTHING can abort the iteration (kills the null-method loop death)
             if(Test-Path $cfg.emergencyFlag){ try{ EmergencyPass }catch{ LErr 'emergency-err' $_ } }
             else {
               foreach($r in $cfg.roots){ try{ Scan $r }catch{ LErr ('scan-err '+$r.tag) $_ } }
@@ -1123,9 +1161,10 @@ jobs:
           Write-Host "[server] SYSTEM task ghrdpserver created+run (independent of step lifecycle)"
           if($cfg.mirror -and (Test-Path $watcherScript)){
             $wTr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$wRun`""
-            & schtasks /Create /TN ghrdpwatcher /TR $wTr /SC ONCE /ST 23:59 /RU SYSTEM /RL HIGHEST /F 2>$null | Out-Null; $LASTEXITCODE=0
+            # run as the RDP user (owner of Downloads/Temp) so the watcher can SEE your files; server stays SYSTEM
+            & schtasks /Create /TN ghrdpwatcher /TR $wTr /SC ONCE /ST 23:59 /RU $env:RDP_USER /RP $env:RDP_PASS /RL HIGHEST /F 2>$null | Out-Null; $LASTEXITCODE=0
             & schtasks /Run /TN ghrdpwatcher 2>$null | Out-Null; $LASTEXITCODE=0
-            Write-Host "[watcher] SYSTEM task ghrdpwatcher created+run"
+            Write-Host "[watcher] task ghrdpwatcher created+run AS RDP USER (sees your Downloads/Temp/D-Storage)"
           }
           $up=$false
           for($i=0;$i -lt 40;$i++){ if((Test-Path $okFile) -and ((Get-Content $okFile -Raw) -match 'LISTENING')){ $up=$true; Write-Host "[server] $((Get-Content $okFile -Raw).Trim())"; break }; Start-Sleep -Milliseconds 500 }
