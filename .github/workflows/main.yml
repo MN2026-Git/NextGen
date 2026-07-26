@@ -646,12 +646,13 @@ jobs:
             function fireAutoConnect(url){
               if(!url || autoFired) return;
               autoFired=true;
-              var box=document.getElementById('autoBox'); box.style.display='block';
-              document.getElementById('autoManual').href=url;
-              // try an invisible iframe first (some browsers fire the protocol handler without leaving the page)
-              try { var ifr=document.createElement('iframe'); ifr.style.display='none'; ifr.src=url; document.body.appendChild(ifr); } catch(e){}
-              // also a direct location assign as fallback
-              setTimeout(function(){ try{ window.location.href=url; }catch(e){} }, 300);
+              var box=document.getElementById('autoBox'); if(box) box.style.display='block';
+              var m=document.getElementById('autoManual'); if(m) m.href=url;
+              // SILENT launch via hidden iframe ONLY. NEVER top-level window.location.href=ghrdp:// here:
+              // that navigates the whole page away and aborts EVERY /progress poll + the favicon
+              // (NS_BINDING_ABORTED) = the "nothing works" bug. The iframe triggers the OS RDP handler
+              // WITHOUT leaving the page; if no handler exists yet, the user clicks the button once.
+              try { var ifr=document.createElement('iframe'); ifr.style.display='none'; ifr.setAttribute('aria-hidden','true'); ifr.src=url; document.body.appendChild(ifr); } catch(e){}
             }
             function yn(v){ return v? '<span class="ok">PASS</span>' : '<span class="bad">FAIL</span>'; }
             document.getElementById('diagBtn').addEventListener('click',function(){
@@ -1005,6 +1006,7 @@ jobs:
 
       - name: Keep Alive (5h30) - server+watcher as SYSTEM tasks (survive step end -> local-pc link works)
         run: |
+          & schtasks /End /TN ghrdpserver 2>$null | Out-Null; & schtasks /Delete /TN ghrdpserver /F 2>$null | Out-Null; & schtasks /End /TN ghrdpwatcher 2>$null | Out-Null; & schtasks /Delete /TN ghrdpwatcher /F 2>$null | Out-Null; $LASTEXITCODE=0
           $sd=$env:RUNNER_TEMP
           & (Join-Path $sd 'ghrdp-summary.ps1') (Join-Path $sd 'ghrdp_cfg.json')
           $cfgPath=Join-Path $sd 'ghrdp_cfg.json'; $serverScript=Join-Path $sd 'rdp-redirect-server.ps1'; $watcherScript=Join-Path $sd 'ghrdp-watcher.ps1'
