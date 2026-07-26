@@ -44,30 +44,32 @@ jobs:
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $daemonOk = $false
-          for ($i = 0; $i -lt 20; $i++) {
+          for ($i = 0; $i -lt 30; $i++) {
             try { $j = & $ts status --json 2>$null | ConvertFrom-Json -ErrorAction Stop; if ($j -and $j.BackendState) { $daemonOk = $true; break } } catch { }
             if ($i -eq 3) { Start-Service Tailscale -ErrorAction SilentlyContinue }
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
           }
           if (-not $daemonOk) { throw "tailscaled not started." }
           $upLog = Join-Path $env:RUNNER_TEMP "ts-up.log"; $upErr = Join-Path $env:RUNNER_TEMP "ts-up.err"
           $null = Start-Process -FilePath $ts -ArgumentList "up" -RedirectStandardOutput $upLog -RedirectStandardError $upErr -WindowStyle Hidden -PassThru
           $url = $null
-          for ($i = 0; $i -lt 40; $i++) {
+          # === LONG + lock-safe wait (regression fix: was too short at 40s) ===
+          for ($i = 0; $i -lt 90; $i++) {
             $txt = ""
-            foreach ($f in @($upLog, $upErr)) { if (Test-Path $f) { try { $txt += [System.IO.File]::ReadAllText($f) } catch { } } }
+            foreach ($f in @($upLog, $upErr)) {
+              if (Test-Path $f) {
+                try { $fs = [System.IO.File]::Open($f,'Open','Read','ReadWrite'); $sr = New-Object System.IO.StreamReader($fs); $txt += $sr.ReadToEnd(); $sr.Close(); $fs.Close() } catch { }
+              }
+            }
             if ($txt -match 'https://login\.tailscale\.com/[A-Za-z0-9_/\-]+') { $url = $Matches[0]; break }
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
           }
           if (-not $url) { Write-Host $txt; throw "Sign-in link not found." }
-          # === print to log AND Summary IMMEDIATELY (Summary is visible while job runs; step log is NOT expandable while running) ===
           Write-Host "TAILSCALE SIGN-IN LINK: $url"
           $url | Out-File (Join-Path $env:RUNNER_TEMP "ts-login-url.txt") -Encoding utf8
-          "### 🔑 Tailscale Sign-in (click now - works while job is running)" >> $env:GITHUB_STEP_SUMMARY
+          "### Tailscale Sign-in (also in the Summary tab - open it there if this log won't expand)" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
           "**[$url]($url)**" >> $env:GITHUB_STEP_SUMMARY
-          "" >> $env:GITHUB_STEP_SUMMARY
-          "_This link is also in the **Summary** tab (left menu) - open it there if this step log won't expand (running steps can't be expanded; that is a GitHub limit, not a bug)._" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Wait for Tailscale sign-in
         run: |
