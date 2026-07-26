@@ -286,7 +286,7 @@ jobs:
           cat > "$RUNNER_TEMP/ghrdp-lib.ps1" <<'EOF'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ErrorActionPreference = 'SilentlyContinue'
-          function Read-Cfg { $r=Get-Content $env:GHRDP_CFG -Raw -EA 0; if($r){ $r=$r.TrimStart([char]0xFEFF); try{ return ($r|ConvertFrom-Json) }catch{} }; return $null }
+          function Read-Cfg { $b=[System.IO.File]::ReadAllBytes($env:GHRDP_CFG); if($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF){ $b=$b[3..($b.Length-1)] }; $t=[System.Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF); return ($t | ConvertFrom-Json) }
           function B64U($s){ $x=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($s)); return $x.Replace('+','-').Replace('/','_').TrimEnd('=') }
           $global:GHRDP_PROG = @{ ts=''; alive=$true; active=@{name='';phase='idle';bytesDone=0;bytesTotal=0;pct=0;speedBps=0}; agg=@{total=0;done=0;active=0;failed=0;tracked=0;bytesDone=0;bytesTotal=0;overallPct=0;speedBps=0}; files=@(); log=@() }
           $global:GHRDP_PROG_PATH = $null; $global:GHRDP_LASTFLUSH = 0
@@ -1061,7 +1061,9 @@ jobs:
           $srvTpl = $srvTpl.Replace('<<SS>>',$serverScript).Replace('<<SD>>',$sd).Replace('<<PR>>',$progressPath).Replace('<<CF>>',$cfgPath).Replace('<<EM>>',$emFlag).Replace('<<FL>>',$flushFlag).Replace('<<OK>>',$okFile)
           [System.IO.File]::WriteAllText($srvRun, $srvTpl, (New-Object System.Text.UTF8Encoding $false))
           $wRun = Join-Path $sd 'ghrdp-watcher-run.ps1'
-          [System.IO.File]::WriteAllText($wRun, ("`$ErrorActionPreference='Continue'`r`n& '<<W>>' '<<CF>>'`r`n".Replace('<<W>>',$watcherScript).Replace('<<CF>>',$cfgPath)), (New-Object System.Text.UTF8Encoding $false))
+          $wTpl = "`$ErrorActionPreference='Continue'`r`n`$progPath = '<<PR>>'`r`ntry {`r`n  `$init = @{ ts=(Get-Date -f o); alive=`$true; agg=@{tracked=0;done=0;active=0;failed=0}; files=@(); log=@('watcher starting...') }`r`n  [System.IO.File]::WriteAllText(`$progPath, (`$init | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding `$false))`r`n  & '<<W>>' '<<CF>>'`r`n} catch {`r`n  `$err = @{ ts=(Get-Date -f o); alive=`$false; agg=@{tracked=0;done=0;active=0;failed=0}; files=@(); log=@(('WATCHER CRASH: ' + `$_.Exception.Message)) }`r`n  try { [System.IO.File]::WriteAllText(`$progPath, (`$err | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding `$false)) } catch {}`r`n}`r`n"
+          $wTpl = $wTpl.Replace('<<W>>',$watcherScript).Replace('<<CF>>',$cfgPath).Replace('<<PR>>',$progressPath)
+          [System.IO.File]::WriteAllText($wRun, $wTpl, (New-Object System.Text.UTF8Encoding $false))
           # === grant SYSTEM read on every file the SYSTEM server/watcher tasks must open (fixes cfgLoaded=False) ===
           foreach($f in @($cfgPath,$serverScript,$watcherScript,$progressPath,$emFlag,$flushFlag,$okFile,(Join-Path $sd 'ghrdp-lib.ps1'),(Join-Path $sd 'ghrdp-ui.html'),(Join-Path $sd 'ghrdp-install.ps1'),(Join-Path $sd 'ghrdp-server-run.ps1'),(Join-Path $sd 'ghrdp-watcher-run.ps1'))){ if(Test-Path $f){ & icacls.exe $f /grant "*S-1-5-18:(R)" 2>$null | Out-Null } }
           & icacls.exe $sd /grant "*S-1-5-18:(OI)(CI)R" 2>$null | Out-Null
