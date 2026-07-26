@@ -838,10 +838,26 @@ jobs:
           function SyncProg{ $p=$global:GHRDP_PROG; $d=0;$u=0;$f=0; foreach($it in $idx){ if($it.status -eq 'ok'){$d++} elseif($it.status -eq 'limit'){$f++} else {$u++} }; $p.agg.done=$d; $p.agg.failed=$f; $p.agg.tracked=$idx.Count; $p.agg.active=if($p.active.phase -ne 'idle'){1}else{0}; $p.agg.bytesTotal=$global:GHRDP_TOTAL_BYTES; $p.files=@( foreach($it in $idx){ @{name=$it.name;src=$it.src;status=$it.status} } ); if(Test-Path $cfg.logFile){ $p.log=@(Get-Content $cfg.logFile -Tail 40 -ErrorAction SilentlyContinue) } else { $p.log=@() }; Flush-Progress $true }
           $fsw=$null
           try{ if(Test-Path $cfg.dlDir){ $fsw=New-Object System.IO.FileSystemWatcher; $fsw.Path=$cfg.dlDir; $fsw.IncludeSubdirectories=$false; $fsw.EnableRaisingEvents=$true; $fsw.NotifyFilter=[System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::Size -bor [System.IO.NotifyFilters]::LastWrite } }catch{}
+          $iter=0
           while($true){
-            if(Test-Path $cfg.emergencyFlag){ EmergencyPass } else { foreach($r in $cfg.roots){ Scan $r }; if(Test-Path $cfg.flushFlag){ "[$(Get-Date -f o)] FLUSH seen"|Out-File $cfg.logFile -Append; for($p=0;$p -lt 8;$p++){ foreach($r in $cfg.roots){Scan $r}; if(-not ($idx | ?{$_.status -ne 'ok'})){break}; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue } }
-            SyncProg
-            Start-Sleep -Seconds 3 }
+            $iter++
+            try {
+              if(Test-Path $cfg.emergencyFlag){ EmergencyPass } else {
+                foreach($r in $cfg.roots){ try{ Scan $r }catch{ $global:GHRDP_PROG.log += ("[scan-err] "+$r.tag+": "+$_.Exception.Message) } }
+                if(Test-Path $cfg.flushFlag){ try{ "[$(Get-Date -f o)] FLUSH seen"|Out-File $cfg.logFile -Append; for($p=0;$p -lt 8;$p++){ foreach($r in $cfg.roots){Scan $r}; if(-not ($idx | ?{$_.status -ne 'ok'})){break}; Start-Sleep -Seconds 8 }; Push-Rentry $cfg (Build-Rentry $cfg $idx)|Out-Null; Remove-Item $cfg.flushFlag -Force -ErrorAction SilentlyContinue }catch{ $global:GHRDP_PROG.log += ("[flush-err] "+$_.Exception.Message) } }
+              }
+              try{ SyncProg }catch{ $global:GHRDP_PROG.log += ("[sync-err] "+$_.Exception.Message) }
+            } catch {
+              try{ $global:GHRDP_PROG.log += ("[loop-err] iter=$iter "+$_.Exception.Message) }catch{}
+            }
+            # DIRECT heartbeat every 3s (proven WriteAllText path, NO atomic Move) -> JS diag never sees stale even if a sub-call throws
+            try{
+              $global:GHRDP_PROG.ts=(Get-Date -f o); $global:GHRDP_PROG.alive=$true
+              if($global:GHRDP_PROG.log.Count -gt 40){ $global:GHRDP_PROG.log = @($global:GHRDP_PROG.log | Select-Object -Last 40) }
+              [System.IO.File]::WriteAllText($global:GHRDP_PROG_PATH, ($global:GHRDP_PROG | ConvertTo-Json -Depth 6 -Compress), (New-Object System.Text.UTF8Encoding $false))
+            }catch{ try{ [System.IO.File]::WriteAllText($progEarly, (@{ts=(Get-Date -f o);alive=$true;log=@("[hb-err] "+$_.Exception.Message)}|ConvertTo-Json -Compress),(New-Object System.Text.UTF8Encoding $false)) }catch{} }
+            Start-Sleep -Seconds 3
+          }
           EOF
 
       # === EDIT 1: launcher - robust Funnel (works when ACL done) + passes funnel status to Summary ===
@@ -1081,6 +1097,9 @@ jobs:
           & icacls.exe $sd /grant "*S-1-5-18:(OI)(CI)R" 2>$null | Out-Null
           $LASTEXITCODE=0
           Write-Host "[perms] SYSTEM (S-1-5-18) read granted on temp files + dir"
+          foreach($r in $cfg.roots){ if($r.path -and (Test-Path $r.path)){ & icacls.exe $r.path /grant "*S-1-5-18:(OI)(CI)R" 2>$null | Out-Null } }
+          $LASTEXITCODE=0
+          Write-Host "[perms] SYSTEM read granted on watcher roots (Downloads/Temp/D-Storage)"
           $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
           # --- SYSTEM scheduled tasks = breakaway from GitHub job object (Start-Process children get killed at step end; tasks do NOT) ---
           $srvTr = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$srvRun`""
