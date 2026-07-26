@@ -660,15 +660,10 @@ jobs:
             document.querySelectorAll('.crow .cp').forEach(function(b){ b.addEventListener('click',function(){ var row=b.closest('.crow'); copyBtn(b, row?row.dataset.val:''); }); });
             function setMode(loop){ var m=document.getElementById('mode'); if(loop){ m.className='mode loop'; m.textContent='◉ RDP / loopback'; } else { m.className='mode funnel'; m.textContent='⬈ LOCAL PC (auto-connect)'; } }
             function fireAutoConnect(url){
-              if(!url || autoFired) return;
-              autoFired=true;
-              var box=document.getElementById('autoBox'); if(box) box.style.display='block';
-              var m=document.getElementById('autoManual'); if(m) m.href=url;
-              // SILENT launch via hidden iframe ONLY. NEVER top-level window.location.href=ghrdp:// here:
-              // that navigates the whole page away and aborts EVERY /progress poll + the favicon
-              // (NS_BINDING_ABORTED) = the "nothing works" bug. The iframe triggers the OS RDP handler
-              // WITHOUT leaving the page; if no handler exists yet, the user clicks the button once.
-              try { var ifr=document.createElement('iframe'); ifr.style.display='none'; ifr.setAttribute('aria-hidden','true'); ifr.src=url; document.body.appendChild(ifr); } catch(e){}
+              // DISABLED on purpose: top-level window.location.href=ghrdp:// navigates the page away
+              // and aborts EVERY /progress poll (NS_BINDING_ABORTED) = creds stay "-".
+              // The user connects by clicking the "OPEN REMOTE DESKTOP" button (ghrdp link) once.
+              return;
             }
             function yn(v){ return v? '<span class="ok">PASS</span>' : '<span class="bad">FAIL</span>'; }
             document.getElementById('diagBtn').addEventListener('click',function(){
@@ -703,8 +698,7 @@ jobs:
               if(s.rentry){ var r=document.getElementById('rentry'); r.style.display='block'; r.textContent='index: '+s.rentry; }
               document.getElementById('mirrorBox').style.display = s.mirror? 'block':'none';
               setCreds(s.creds); setGhrdp(s.ghrdp); setMode(!!s.viaLoopback);
-              // AUTO-CONNECT only when viewed from the LOCAL pc (Funnel), never from inside RDP loopback
-              if(s.ghrdp && !s.viaLoopback){ fireAutoConnect(s.ghrdp); }
+              // auto-fire removed: user clicks "OPEN REMOTE DESKTOP" (zero typing, one click)
               var a=s.agg||{}; window.__PCT=a.overallPct||0; window.__BDONE=a.bytesDone||0;
               document.getElementById('bTotal').textContent=fb(a.bytesTotal); document.getElementById('speed').textContent=fs(a.speedBps);
               document.getElementById('eta').textContent=fe((a.bytesTotal||0)-(a.bytesDone||0),a.speedBps);
